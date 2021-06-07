@@ -108,7 +108,7 @@ datSum %>%
   pack_rows(start_row=16,end_row=16,group_label=paste(sep="","Age; n = ",sum(!is.na(dat$age))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$age))/nrow(dat))),"%)")) %>%
   pack_rows(start_row=17,end_row=17,group_label=paste(sep="","BMI; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
   pack_rows(start_row=18,end_row=18,group_label=paste(sep="","Transient elastography; n = ",sum(!is.na(dat$te))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$te))/nrow(dat))),"%)")) %>%
-  pack_rows(start_row=19,end_row=19,group_label=paste(sep="","APRI (AST to platelet ratio); n = ",sum(!is.na(dat$apri))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$apr))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=19,end_row=19,group_label=paste(sep="","APRI (AST to platelet ratio); n = ",sum(!is.na(dat$apri))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$apri))/nrow(dat))),"%)")) %>%
   pack_rows(start_row=20,end_row=20,group_label=paste(sep="","GPR (GGT to platelet ratio); n = ",sum(!is.na(dat$gpr))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$gpr))/nrow(dat))),"%)")) %>%
   pack_rows(start_row=21,end_row=21,group_label=paste(sep="","Fibrosis 4 score; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
   pack_rows(start_row=22,end_row=22,group_label=paste(sep="","ALT; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)"))
@@ -240,11 +240,12 @@ sensSpecMatKable %>%
   pack_rows(start_row=34,end_row=36,group_label="Site 11")
 ```
 
+
 ## Null model (same sensitivity / specificity per site)
 
 This model directly estimates a single sensitivity and specificity.
 
-```{r model0, warning=F, message=F}
+```{r model0nohet, warning=F, message=F}
 datJags<-list()
 
 datJags$N<-nrow(dat)
@@ -254,7 +255,7 @@ datJags$y<-dat$apri_20
 randSeed<-20210521
 set.seed(randSeed)
 
-jagsModel0_te115_apri20 <- jags.model('jagsModel0_NullNoHet_20210606.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+jagsModel0_te115_apri20 <- jags.model('jagsModel0_NullNoHet.jags', data=datJags, n.chains = 4, n.adapt = 1000)
 parsModel0_te115_apri20<-coda.samples(model=jagsModel0_te115_apri20,variable.names=c('p_sens','p_spec'),n.iter=5000)
 dicModel0_te115_apri20<-dic.samples(jagsModel0_te115_apri20,type="pD",n.iter=1000)
 
@@ -262,11 +263,12 @@ print(summary(parsModel0_te115_apri20))
 print(gelman.diag(parsModel0_te115_apri20))
 ```
 
+
 ## Null model (different sensitivity / specificty per site)
 
 This model directly estimates a single sensitivity and specificity per site.
 
-```{r model0, warning=F, message=F}
+```{r model0withhet, warning=F, message=F}
 datJags<-list()
 
 datJags$N<-nrow(dat)
@@ -278,13 +280,14 @@ datJags$y<-dat$apri_20
 randSeed<-20210521
 set.seed(randSeed)
 
-jagsModel0_te115_apri20 <- jags.model('jagsModel0_NullWithHet_20210606.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+jagsModel0_te115_apri20 <- jags.model('jagsModel0_NullWithHet.jags', data=datJags, n.chains = 4, n.adapt = 1000)
 parsModel0_te115_apri20<-coda.samples(model=jagsModel0_te115_apri20,variable.names=c('p_sens','p_spec'),n.iter=5000)
 dicModel0_te115_apri20<-dic.samples(jagsModel0_te115_apri20,type="pD",n.iter=1000)
 
 print(summary(parsModel0_te115_apri20))
 print(gelman.diag(parsModel0_te115_apri20))
 ```
+
 
 ## Model 1
 
@@ -302,20 +305,22 @@ datJags$y<-dat$apri_20
 randSeed<-20210521
 set.seed(randSeed)
 
-jagsModel1_te115_apri20 <- jags.model('jagsModel1_NoIndivRandomNoCovariates_20210524.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+jagsModel1_te115_apri20 <- jags.model('jagsModel1_NoIndivRandomNoCovariates.jags', data=datJags, n.chains = 4, n.adapt = 1000)
 parsModel1_te115_apri20<-coda.samples(model=jagsModel1_te115_apri20,variable.names=c('beta','p_sens','p_spec'),n.iter=5000)
 dicModel1_te115_apri20<-dic.samples(jagsModel1_te115_apri20,type="pD",n.iter=1000)
 
 print(summary(parsModel1_te115_apri20))
 print(gelman.diag(parsModel1_te115_apri20))
 ```
-}
+
 
 ## Model 2
 
 This model estimates sensitivity and specificity with study and individual random effects, and does not take either individual or study covariates into account.
+This model is quite slow, given that it has a random error for each observation.
+R chunk below is skipped / not evaluated.
 
-```{r model2, warning=F, message=F}
+```{r model2, warning=F, message=F, eval=F}
 datJags<-list()
 
 datJags$N<-nrow(dat)
@@ -327,13 +332,14 @@ datJags$y<-dat$apri_20
 randSeed<-20210521
 set.seed(randSeed)
 
-jagsModel2_te115_apri20 <- jags.model('jagsModel2_IndivRandomNoCovariates_20210524.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+jagsModel2_te115_apri20 <- jags.model('jagsModel2_IndivRandomNoCovariates.jags', data=datJags, n.chains = 4, n.adapt = 1000)
 parsModel2_te115_apri20<-coda.samples(model=jagsModel2_te115_apri20,variable.names=c('beta'),n.iter=5000)
-dicModel2_te115_apri20<-dic.samples(jagsModel2_te115_apri20,type="pD",n.iter=1000) # complains about there being no stochastic nodes which is nonsense; somewhat worrying though
+dicModel2_te115_apri20<-dic.samples(jagsModel2_te115_apri20,type="pD",n.iter=1000) 
 
 print(summary(parsModel2_te115_apri20))
 print(gelman.diag(parsModel2_te115_apri20))
 ```
+
 
 ## Model 3
 
@@ -374,10 +380,11 @@ for(i in unique(as.integer(factor(dat$Sitecountry)))){
 randSeed<-20210606
 set.seed(randSeed)
 
-jagsModel4_te115_apri20 <- jags.model('jagsModel4_IndivAndStudyCovariates_20210606.jags', data=datJags, n.chains = 4, n.adapt = 5000)
-parsModel4_te115_apri20<-coda.samples(model=jagsModel4_te115_apri20,variable.names=c('beta','gamma1W','gamma1B','gamma2W','gamma2B','gamma3W','gamma3B','gamma4W','gamma4B','lambda'),n.iter=5000)
+jagsModel4_te115_apri20 <- jags.model('jagsModel4_IndivAndStudyCovariates.jags', data=datJags, n.chains = 4, n.adapt = 2000)
+parsModel4_te115_apri20<-coda.samples(model=jagsModel4_te115_apri20,variable.names=c('beta','gamma1W','gamma1B','gamma2W','gamma2B','gamma3W','gamma3B','gamma4W','gamma4B','lambda'),n.iter=10000)
 dicModel4_te115_apri20<-dic.samples(jagsModel4_te115_apri20,type="pD",n.iter=1000) 
 
 print(summary(parsModel4_te115_apri20))
 print(gelman.diag(parsModel4_te115_apri20))
 ```
+
