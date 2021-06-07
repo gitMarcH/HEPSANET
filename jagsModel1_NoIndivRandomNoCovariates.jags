@@ -1,0 +1,36 @@
+model{
+
+# model
+for(j in 1:N){
+  y[j]~dbern(p[study[j],state[j]])
+}
+
+for(i in 1:m){
+  p[i,1]=p_sens[i] # state 1 = diseased / positive
+  p[i,2]=1-p_spec[i] # state 2 = healthy / negative
+  
+  p_sens[i]=exp_p_sens[i]/(1+exp_p_sens[i])
+  exp_p_sens[i]=exp(beta[1] +u[i,1])
+  
+  p_spec[i]=exp_p_spec[i]/(1+exp_p_spec[i])
+  exp_p_spec[i]=exp(beta[2] +u[i,2])
+}
+
+for(i in 2:m){
+  u[i,1:2]~dmnorm(c(0,0), Omega[1:2,1:2]) # Omega is precision matrix
+}
+u[1,1]=-sum(u[2:m,1]) # needed for model identifiability
+u[1,2]=-sum(u[2:m,2]) # needed for model identifiability
+
+# priors
+beta[1]~dnorm(0,1/100000) # same as in Riley et al (2008)
+beta[2]~dnorm(0,1/100000) # same as in Riley et al (2008)
+
+Omega[1:2,1:2]~dwish(R[1:2,1:2],k) # same as in Riley et al (2008)
+R[1,1]=1
+R[1,2]=0
+R[2,1]=0
+R[2,2]=1
+k=2
+
+}
