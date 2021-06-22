@@ -33,4 +33,9 @@ R[2,1]=0
 R[2,2]=1
 k=2
 
+# derived quantities
+sens=ilogit(beta[1])
+spec=ilogit(beta[2])
+reSens=Omega[2,2]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
+reSpec=Omega[1,1]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
 }

@@ -1,0 +1,56 @@
+model{
+
+# model
+for(j in 1:N){
+  y[j]~dbern(p[j])
+  
+  p[j]=ifelse(state[j]==1,exp_p[j]/(1+exp_p[j]),1-exp_p[j]/(1+exp_p[j]))
+  exp_p[j]=exp(beta[state[j]] + gammaS[state[j]]*testReasonS[j] + gammaL[state[j]]*testReasonL[j] + gammaN[state[j]]*testReasonN[j] + gammaA[state[j]]*alc[j]+ lambda[state[j]]*studyTypeHospital[j] + u[study[j],state[j]])
+  
+  alc[j]~dbern(palc)
+}
+
+for(i in 2:m){
+  u[i,1:2]~dmnorm(c(0,0), Omega[1:2,1:2]) # Omega is precision matrix
+}
+u[1,1]=-sum(u[2:m,1]) # needed for model identifiability
+u[1,2]=-sum(u[2:m,2]) # needed for model identifiability
+
+# priors
+beta[1]~dnorm(0,1/100000) # same as in Riley et al (2008)
+beta[2]~dnorm(0,1/100000) # same as in Riley et al (2008)
+gammaS[1]~dnorm(0,1/100000)
+gammaS[2]~dnorm(0,1/100000)
+gammaN[1]~dnorm(0,1/100000)
+gammaN[2]~dnorm(0,1/100000)
+gammaL[1]~dnorm(0,1/100000)
+gammaL[2]~dnorm(0,1/100000)
+gammaA[1]~dnorm(0,1/100000)
+gammaA[2]~dnorm(0,1/100000)
+lambda[1]~dnorm(0,1/100000)
+lambda[2]~dnorm(0,1/100000)
+palc~dbeta(0.5,0.5)
+
+Omega[1:2,1:2]~dwish(R[1:2,1:2],2) # same as in Riley et al (2008)
+R[1,1]=1
+R[1,2]=0
+R[2,1]=0
+R[2,2]=1
+k=2
+
+# derived quantities
+sens=ilogit(beta[1])
+spec=ilogit(beta[2])
+orGammaS[1]=exp(gammaS[1])
+orGammaS[2]=exp(gammaS[2])
+orGammaN[1]=exp(gammaN[1])
+orGammaN[2]=exp(gammaN[2])
+orGammaL[1]=exp(gammaL[1])
+orGammaL[2]=exp(gammaL[2])
+orGammaA[1]=exp(gammaA[1])
+orGammaA[2]=exp(gammaA[2])
+orLambda[1]=exp(lambda[1])
+orLambda[2]=exp(lambda[2])
+reSens=Omega[2,2]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
+reSpec=Omega[1,1]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
+}
