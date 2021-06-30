@@ -1,0 +1,925 @@
+---
+title: "HEPSANET analysis"
+author: "Marc Henrion"
+date: "28 June 2021"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(rjags)
+library(HDInterval)
+library(scam)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE)
+
+outDir<-paste(sep="","../output/",gsub(pattern="-",replacement="",Sys.Date()))
+if(!dir.exists(outDir)){dir.create(outDir,recursive=TRUE)}
+```
+
+## Purpose of this analysis
+
+This report fits bivariate Bayesian model similar to those described in [Riley et al (2008)](https://doi.org/10.1002/sim.3441), [Reitsma et al (2005)](https://doi.org/10.1016/j.jclinepi.2005.02.022) and [Owen et al (2018)](https://doi.org/10.1016/j.jclinepi.2018.03.005) in order to get a meta-analysis estimate of the operational characteristics of diagnostic tests for liver fibrosis and cirrhosis based on different biomarkers.
+
+Below we define 4 models, corresponding to those from [Riley et al (2008)](https://doi.org/10.1002/sim.3441). Each of those models would be fit several times: for each combination of reference diagnostic and experimental diagnostic.
+
+## Reading the data extracted during the systematic review
+
+```{r readData}
+datFile<-"../2021-06-24_RevisedData/HEPSANET_biomarker_cleaned_data.csv"
+dat<-read.csv(datFile)
+
+dat<-dat %>%
+  mutate(ReasontotestHBVSCLF=gsub(pattern=" ",replacement="",case_when(ReasontotestHBVSCLF==""~"N",ReasontotestHBVSCLF=="I"~"L",TRUE~ReasontotestHBVSCLF))) %>%
+  mutate(
+    testReason=factor(ReasontotestHBVSCLF,levels=c("C","S","L","F","N")),
+    studyType=factor(hosp_com)
+    )
+
+setOfDummyVars<-model.matrix(~studyType+testReason,data=dat)
+dat<-cbind(dat,setOfDummyVars[,-1])
+```
+
+The file `r datFile` contains `r nrow(dat)` rows / observations and `r ncol(dat)` columns / variables.
+
+Notes (as per Alex's email from 24 June 2021):
+
+* 2 samples (`SN030`, `SN021`) has reason for testing listed as `I`, These have been replaced these with `L`.
+
+* Only 2 samples (`H014`, `H009`) were the reason for testing is `F`. These have been merged with `S`?
+
+```{r dataRecoding}
+dat$testReason[dat$Nomerged %in% c("H014","H009")]<-"S"
+
+dat<-dat %>%
+  mutate(testReason=factor(as.character(testReason),levels=c("C","S","L","N")))
+```
+
+## Filtering out participants
+
+We filter out participants who are positive for hepatitis C and/or D infection using the variables `antihcv`, `hcvrna`, and `antihdv` (all participants positive for any of these are filtered out). Participants with no records for these variables are retained.
+
+```{r hepFilter}
+nBefore<-nrow(dat)
+
+dat<-dat %>%
+  filter((is.na(antihcv) | antihcv!=1) &
+           (is.na(hcvrna) | hcvrna!=1) &
+           (is.na(antihdv) |antihdv!=1))
+```
+
+This has filtered out `r nBefore-nrow(dat)` participants, leaving `r `nrow(dat)` participants for the analysis.
+
+
+```{r summaryData}
+sumFun<-function(dat,vars,type,digs=2,na.rm=TRUE){
+  # dat = data frame to be summarised
+  # vars = character vector with variables names
+  # type = character vector of same length as vars specifying the type of summary to compute (needs to be one of "mean_sd","median_iqr","n_perc")
+  # digs = integer specifying the number of decimal digits to report (defaults to 2)
+  # na.rm = whether to remove NAs or not (defaults to TRUE)
+  
+  res<-data.frame(
+    var=character(0),
+    stat1=character(0),
+    stat2=character(0)
+  )
+  
+  for(i in 1:length(vars)){
+    if(type[i]=="mean_sd"){
+      stat1<-format(nsmall=digs,round(digits=digs,mean(dat[,vars[i]],na.rm=T)))
+      stat2<-paste(sep="","(",format(nsmall=digs,round(digits=digs,sd(dat[,vars[i]],na.rm=T))),")")
+      #varName<-paste(sep=" ",vars[i],"; mean (sd)")
+      varName<-paste(sep=" ","mean (sd)")
+      
+      res<-rbind(res,c(varName,stat1,stat2))
+      rm(varName,stat1,stat2)
+    }else if(type[i]=="median_iqr"){
+      stat1<-format(nsmall=digs,round(digits=digs,median(dat[,vars[i]],na.rm=T)))
+      stat2<-paste(sep="","(",paste(collapse=",",format(nsmall=digs,round(digits=digs,quantile(dat[,vars[i]],probs=c(0.25,0.75),na.rm=T)))),")")
+      
+      #varName<-paste(sep=" ",vars[i],"; median (IQR)")
+      varName<-paste(sep=" ","median (IQR)")
+      res<-rbind(res,c(varName,stat1,stat2))
+      rm(varName,stat1,stat2)
+    }else if(type[i]=="n_perc"){
+      for(val in sort(unique(dat[,vars[i]]))){
+        stat1<-sum(dat[,vars[i]]==val,na.rm=T)
+        stat2<-paste(sep="","(",format(nsmall=digs,round(digits=digs,100*sum(dat[,vars[i]]==val,na.rm=T)/sum(!is.na(dat[,vars[i]])))),"%)")
+        
+        #varName<-paste(sep="",vars[i],"; ",val,"; n (%)")
+        varName<-paste(sep="",val,"; n (%)")
+        res<-rbind(res,c(varName,stat1,stat2))
+        rm(varName,stat1,stat2)
+      }
+    }
+  }
+  
+  colnames(res)<-c("variable","stat1","stat2")
+  return(res)
+}
+  
+datSum<-sumFun(dat,
+               vars=c("hosp_com","site","sex","age","bmi","te","apri","gpr","fib4","alt"),
+               type=c("n_perc","n_perc","n_perc","median_iqr","mean_sd","median_iqr","median_iqr","median_iqr","median_iqr","median_iqr","median_iqr"))
+
+datSum %>%
+  kable(caption="Patient characteristics",row.names=F) %>%
+  kable_styling(full_width=F) %>%
+  pack_rows(start_row=1,end_row=2,group_label=paste(sep="","Type of study; n = ",sum(!is.na(dat$hosp_com))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$hosp_com))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=3,end_row=13,group_label=paste(sep="","Site; n = ",sum(!is.na(dat$site))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$site))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=14,end_row=15,group_label=paste(sep="","Sex; n = ",sum(!is.na(dat$sex))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$age))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=16,end_row=16,group_label=paste(sep="","Age; n = ",sum(!is.na(dat$age))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$age))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=17,end_row=17,group_label=paste(sep="","BMI; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=18,end_row=18,group_label=paste(sep="","Transient elastography; n = ",sum(!is.na(dat$te))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$te))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=19,end_row=19,group_label=paste(sep="","APRI (AST to platelet ratio); n = ",sum(!is.na(dat$apri))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$apri))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=20,end_row=20,group_label=paste(sep="","GPR (GGT to platelet ratio); n = ",sum(!is.na(dat$gpr))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$gpr))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=21,end_row=21,group_label=paste(sep="","Fibrosis 4 score; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=22,end_row=22,group_label=paste(sep="","ALT; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)"))
+```
+
+
+## Definiton of the gold standard diagnosis
+
+Reference standards (which are assumed to be gold standards) are based on variable `te`, transient elastrography result. Specifically:
+
+* Cirrhosis (F4) if $te>11.5kPa$ (sensitivity analysis $te>9.5kPa$)
+* Significant fibrosis (F2) if $te>7.9kPa$
+
+In the dataset, these 3 gold standards are encoded by variables `te_115`, `te_95` and `te_79`.
+
+```{r defineVarsGold}
+dat<-dat %>%
+  mutate(
+    te_115=ifelse(te>11.5,1,0),
+    te_95=ifelse(te>9.5,1,0),
+    te_79=ifelse(te>7.9,1,0),
+  )
+```
+
+## Diagnostics to be evaluated
+
+* `apri` - AST to platelet ratio index. For F4 use threshold of $\geq 2.0$ and for F2 use $\geq 1.5$. In the dataset, these 2 experimental diagnostics are encoded by variables `apri_20` and `apri_15`. Note: we will also derive an optimum threshold.
+
+* `gpr` - GGT to platelet ratio. For F4 use threshold $\geq 0.56$ and for F2 use $\geq 0.32$. In the dataset, these 2 experimental diagnostics are encoded by variables `gpr_56` and `gpr_32`.
+
+* `fib4` - fibrosis 4 score. We need to derive a score for this; no a prior defined threshold.
+
+* `alt` - ALT. We need to derive a score for this; no a prior defined threshold.
+
+
+```{r defineVarsEval}
+dat<-dat %>%
+  mutate(
+    apri_20=ifelse(apri>=2,1,0),
+    apri_15=ifelse(apri>=1.5,1,0),
+    gpr_56=ifelse(gpr>=0.56,1,0),
+    gpr_32=ifelse(gpr>=0.32,1,0),
+  )
+```
+
+## Very naive analysis (to get feel for data)
+
+Let's just assume we could analyse all individual-level data as is, simply pulling out the sensitivity, specificity rather than fitting a model that considers random effects and individual- and study-level covariates.
+
+```{r naiveSensSpec}
+gr<-rbind(
+  c(11.5,"2.0","0.56"),
+  c(9.5,"2.0","0.56"),
+  c(7.9,"1.5","0.32")
+)
+
+rnames<-character(0)
+for(s in c("All",sort(unique(dat$Sitecountry)))){
+  for(i in 1:3){
+    rnames<-c(rnames,paste(sep="_",paste(sep="","Site",s),paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))))
+  }
+}
+rnames<-gsub(rnames,pattern="SiteAll",replacement="All")
+
+sensSpecMat<-matrix(nrow=3*(length(unique(dat$Sitecountry))+1),ncol=8)
+rownames(sensSpecMat)<-rnames
+colnames(sensSpecMat)<-c("site","te","apri","gpr","apri_sens","apri_spec","gpr_sens","gpr_spec")
+sensSpecMat<-as.data.frame(sensSpecMat)
+
+for(s in c("All",sort(unique(dat$Sitecountry)))){
+  if(s=="All"){
+    datTmp<-dat
+  }else{
+    datTmp<-dat %>% filter(Sitecountry==s)
+    s<-paste(sep="","Site",s)
+  }
+    
+  for(i in 1:nrow(gr)){
+    gthr<-gr[i,1]
+    thr1<-gr[i,2]
+    thr2<-gr[i,3]
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"site"]<-gsub(s,pattern="Site",replacement="")
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"te"]<-gthr
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri"]<-thr1
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr"]<-thr2
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri_sens"]<-mean(datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==1,paste(sep="_","apri",gsub(thr1,pattern="\\.",replacement=""))])
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr_sens"]<-mean(datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==1,paste(sep="_","gpr",gsub(thr2,pattern="0\\.",replacement=""))],na.rm=T)
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri_spec"]<-mean(1-datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==0,paste(sep="_","apri",gsub(thr1,pattern="\\.",replacement=""))])
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr_spec"]<-mean(1-datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==0,paste(sep="_","gpr",gsub(thr2,pattern="0\\.",replacement=""))],na.rm=T)
+    
+  }
+}
+
+sensSpecMatKable<-sensSpecMat
+for(i in 1:nrow(sensSpecMat)){
+  for(j in 5:ncol(sensSpecMat)){
+    if(!is.na(sensSpecMat[i,j])){
+      sensSpecMatKable[i,j]<-paste(sep="",format(nsmall=1,round(digits=1,100*sensSpecMat[i,j])),"%")
+    }else{
+      sensSpecMatKable[i,j]<-"-"
+    }
+  }
+}
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te11.5_apri2.0_gpr0.56")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te11.5_apri2.0_gpr0.56")],pattern="_te11.5_apri2.0_gpr0.56",replacement="; te > 11.5 (apri > 2.0, gpr > 0.56)")
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te9.5_apri2.0_gpr0.56")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te9.5_apri2.0_gpr0.56")],pattern="_te9.5_apri2.0_gpr0.56",replacement="; te > 9.5 (apri > 2.0, gpr > 0.56)")
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te7.9_apri1.5_gpr0.32")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te7.9_apri1.5_gpr0.32")],pattern="_te7.9_apri1.5_gpr0.32",replacement="; te > 7.9 (apri > 1.5, gpr > 0.32)")
+
+sensSpecMatKable <- cbind("",sensSpecMatKable)
+
+sensSpecMatKable %>%
+  dplyr::select(!site) %>%
+  kable(caption="Naive sensitivity and specificity estimates (expressed as percentages).",col.names=c(" ","TE","APRI","GPR","Sensitivity","Specificity","Sensitivity","Specificity"),row.names = FALSE) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c(" "=1,"Diagnostic thresholds"=3,"APRI"=2,"GPR"=2)) %>%
+  pack_rows(start_row=1,end_row=3,group_label="All samples") %>%
+  pack_rows(start_row=4,end_row=6,group_label="Site 1") %>%
+  pack_rows(start_row=7,end_row=9,group_label="Site 2") %>%
+  pack_rows(start_row=10,end_row=12,group_label="Site 3") %>%
+  pack_rows(start_row=13,end_row=15,group_label="Site 4") %>%
+  pack_rows(start_row=16,end_row=18,group_label="Site 5") %>%
+  pack_rows(start_row=19,end_row=21,group_label="Site 6") %>%
+  pack_rows(start_row=22,end_row=24,group_label="Site 7") %>%
+  pack_rows(start_row=25,end_row=27,group_label="Site 8") %>%
+  pack_rows(start_row=28,end_row=30,group_label="Site 9") %>%
+  pack_rows(start_row=31,end_row=33,group_label="Site 10") %>%
+  pack_rows(start_row=34,end_row=36,group_label="Site 11")
+```
+
+
+**Question:**
+
+Sensitivity and specificity are extremely variable from study to study. I find it difficult to understand this. You would expect some heterogeneity due to how certain diagnostics are delivered, some underlying characteristics that impct test results which vary from population to population, but not quite to this extent. Positive and negative predictive values can vary a lot from one population to another, but that is because these, unlike sensitvity and specificity, depend on the prevalence of the condition under investigation.
+
+Would be good to discuss this.
+
+
+## APRI with threshold 2.0, te with threshold 11.5
+
+### Null model (same sensitivity / specificity per site)
+
+This model directly estimates a single sensitivity and specificity. It assumes a common sensitivity / specificity with all observed variation simply due to sampling error.
+
+```{r model0nohet, warning=F, message=F, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$state<-ifelse(dat$te_115==1,1,2)
+datJags$y<-dat$apri_20
+  
+randSeed<-20210521
+set.seed(randSeed)
+
+jagsModel0_te115_apri20 <- jags.model('jagsModel0_NullNoHet.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+parsModel0_te115_apri20<-coda.samples(model=jagsModel0_te115_apri20,variable.names=c('p_sens','p_spec'),n.iter=5000)
+dicModel0_te115_apri20<-dic.samples(jagsModel0_te115_apri20,type="pD",n.iter=1000)
+
+#print(summary(parsModel0_te115_apri20))
+#print(gelman.diag(parsModel0_te115_apri20))
+```
+
+
+This model has a DIC of `r sum(dicModel0_te115_apri20$deviance)+sum(dicModel0_te115_apri20$penalty)` and the multivariate Gelman-Rubin convergence diagnostic statistics is `r gelman.diag(parsModel0_te115_apri20)$mpsrf`.
+
+The model-estimated common sensitivity and specificity are given in the table below:
+
+```{r model0nohetSummary}
+tmp<-summary(parsModel0_te115_apri20)$statistics
+tmpCI<-t(hdi(parsModel0_te115_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("sensitivity","specificity")
+
+tmp %>%
+  kable(caption="Null model: common sensitivity and specificity.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+### Model with different sensitivity / specificity per site (fixed effects)
+
+This second model directly estimates a single sensitivity and specificity per site with all remaining observed variation due to sampling error.
+
+```{r model0withhet, warning=F, message=F, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry,levels=as.character(1:11))))
+datJags$study<-as.integer(factor(dat$Sitecountry,levels=as.character(1:11)))
+datJags$state<-ifelse(dat$te_115==1,1,2)
+datJags$y<-dat$apri_20
+  
+randSeed<-20210521
+set.seed(randSeed)
+
+jagsModel00_te115_apri20 <- jags.model('jagsModel0_NullWithHet.jags', data=datJags, n.chains = 4, n.adapt = 1000)
+parsModel00_te115_apri20<-coda.samples(model=jagsModel00_te115_apri20,variable.names=c('p_sens','p_spec'),n.iter=5000)
+dicModel00_te115_apri20<-dic.samples(jagsModel00_te115_apri20,type="pD",n.iter=1000)
+
+#print(summary(parsModel0_te115_apri20))
+#print(gelman.diag(parsModel0_te115_apri20))
+```
+
+This model has a DIC of `r sum(dicModel00_te115_apri20$deviance)+sum(dicModel00_te115_apri20$penalty)` and the multivariate Gelman-Rubin convergence diagnostic statistics is `r gelman.diag(parsModel00_te115_apri20)$mpsrf`.
+
+The model-estimated common sensitivity and specificity are given in the table below:
+
+```{r model0withhetSummary}
+tmp<-summary(parsModel00_te115_apri20)$statistics
+tmpCI<-t(hdi(parsModel00_te115_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c(paste(sep="","sensitivity site ",1:max(dat$Sitecountry)),paste(sep="","specificity site ",1:max(dat$Sitecountry)))
+
+tmp %>%
+  kable(caption="Model with site/sudy specific sensitivities and specificities (fixed effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+### Model with different sensitivity / specificity per site (random effects)
+
+This is model (1) from [Riley et al (2008)](https://doi.org/10.1002/sim.3441).
+
+This model estimates summary sensitivity and specificity with study random effects only, and does not take either individual or study covariates into account. It is quite similar to the model above, but models the study effects as random effects rather than fixed effects; i.e. it considers the studies included in the study to be a random subset of possible sites rather than a complete list of them.
+
+```{r model1_apri20_te115, warning=F, message=F, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+datJags$study<-as.integer(factor(dat$Sitecountry))
+datJags$state<-ifelse(dat$te_115==1,1,2)
+datJags$y<-dat$apri_20
+  
+randSeed<-20210521
+set.seed(randSeed)
+
+jagsModel1_te115_apri20 <- jags.model('jagsModel1_NoIndivRandomNoCovariates.jags', data=datJags, n.chains = 4, n.adapt = 10000)
+parsModel1_te115_apri20<-coda.samples(model=jagsModel1_te115_apri20,variable.names=c('sens','spec','p_sens','p_spec','reSens','reSpec'),n.iter=5000)
+dicModel1_te115_apri20<-dic.samples(jagsModel1_te115_apri20,type="pD",n.iter=1000)
+
+#print(summary(parsModel1_te115_apri20))
+#print(gelman.diag(parsModel1_te115_apri20))
+
+#This model has a DIC of `r sum(dicModel1_te115_apri20$deviance)+sum(dicModel1_te115_apri20$penalty)` and the multivariate Gelman-Rubin convergence diagnostic statistics is `r gelman.diag(parsModel1_te115_apri20)$mpsrf`.
+```
+
+The model-estimated common sensitivity and specificity are given in the table below:
+
+```{r model1_apri20_te115Summary}
+tmp<-summary(parsModel1_te115_apri20)$statistics
+tmpCI<-t(hdi(parsModel1_te115_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c(paste(sep="","sensitivity site ",1:max(dat$Sitecountry)),paste(sep="","specificity site ",1:max(dat$Sitecountry)),"random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+
+tmp %>%
+  kable(caption="Model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+### Model with individual- and study-level covariates and study-specific random effects
+
+This is model (4) from [Riley et al (2008)](https://doi.org/10.1002/sim.3441).
+
+This model estimates summary sensitivity and specificity with study random effects and individual- and study-level covariates. We include the following covariates:
+
+* study type (community or hospital based)
+* reason for testing (community-based [C, default], routine screening [S], suspicion of liver disease [L] or not documented [N])
+* hazardous alcohol drinking (yes/no)
+
+```{r model4NoBetweenStudyEffects_apri20_te115, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+datJags$study<-as.integer(factor(dat$Sitecountry))
+datJags$state<-ifelse(dat$te_115==1,1,2)
+datJags$y<-dat$apri_20
+datJags$studyTypeHospital<-dat$studyTypeHospital
+datJags$testReasonS<-dat$testReasonS
+datJags$testReasonL<-dat$testReasonL
+datJags$testReasonN<-dat$testReasonN
+datJags$alc<-dat$alc
+
+randSeed<-20210615
+set.seed(randSeed)
+
+jagsModel4_te115_apri20 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc.jags', data=datJags, n.chains = 4, n.adapt = 5000)
+parsModel4_te115_apri20<-coda.samples(model=jagsModel4_te115_apri20,variable.names=c('sens','spec','orGammaS','orGammaN','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=5000)
+dicModel4_te115_apri20<-dic.samples(jagsModel4_te115_apri20,type="pD",n.iter=1000) 
+
+#print(summary(parsModel4_te115_apri20))
+#print(gelman.diag(parsModel4_te115_apri20))
+
+# pdf(width=10,height=10,file=paste(sep="/",outDir,"HEPSANET_jagsModel4_te115_apri20_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc.pdf"))
+# plot(parsModel4_te115_apri20,auto.layout=FALSE)
+# dev.off()
+#This model has a DIC of `r sum(dicModel4_te115_apri20$deviance)+sum(dicModel4_te115_apri20$penalty)` and the multivariate Gelman-Rubin convergence diagnostic statistics is `r gelman.diag(parsModel4_te115_apri20)$mpsrf`.
+```
+
+The model-estimated overall sensitivity and specificity are given in the table below:
+
+```{r model4_apri20_te115Summary}
+tmp<-try(summary(parsModel4_te115_apri20)$statistics,silent=TRUE)
+tmpCI<-t(hdi(parsModel4_te115_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","no reason for screening recorded (OR for sensitivity)","no reason for screening recorded (OR for specificity)","routine screening (OR for sensitivity)","routine screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+
+tmp %>%
+  kable(caption="Model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+We also try a simplified version of the model above where we only include a term for testing reason `L` (suspected liver disease).
+
+```{r model4NoBetweenStudyEffectsSimple_apri20_te115, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+datJags$study<-as.integer(factor(dat$Sitecountry))
+datJags$state<-ifelse(dat$te_115==1,1,2)
+datJags$y<-dat$apri_20
+datJags$studyTypeHospital<-dat$studyTypeHospital
+datJags$testReasonL<-dat$testReasonL
+datJags$alc<-dat$alc
+
+randSeed<-20210615
+set.seed(randSeed)
+
+jagsModel4_te115_apri20 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 2000)
+parsModel4_te115_apri20<-coda.samples(model=jagsModel4_te115_apri20,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=5000)
+dicModel4_te115_apri20<-dic.samples(jagsModel4_te115_apri20,type="pD",n.iter=1000) 
+
+#print(summary(parsModel4_te115_apri20))
+#print(gelman.diag(parsModel4_te115_apri20))
+
+# pdf(width=10,height=10,file=paste(sep="/",outDir,"HEPSANET_jagsModel4_te115_apri20_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.pdf"))
+# plot(parsModel4_te115_apri20,auto.layout=FALSE)
+# dev.off()
+#This model has a DIC of `r sum(dicModel4_te115_apri20$deviance)+sum(dicModel4_te115_apri20$penalty)` and the multivariate Gelman-Rubin convergence diagnostic statistics is `r gelman.diag(parsModel4_te115_apri20)$mpsrf`.
+```
+
+The model-estimated overall sensitivity and specificity are given in the table below:
+
+```{r model4_apri20_te115SimpleSummary}
+tmp<-try(summary(parsModel4_te115_apri20)$statistics,silent=TRUE)
+tmpCI<-t(hdi(parsModel4_te115_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+
+tmp %>%
+  kable(caption="Model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## APRI ROC curve for te threshold 11.5
+
+```{r apriVect, warning=F, message=F, error=FALSE, results='hide'}
+#apriVect<-c(0,seq(0.1,0.7,by=0.05),seq(0.7,3,by=0.1))
+apriVect<-unique(c(0,1.5,2,quantile(dat$apri,probs=seq(0,1,length=40))))
+apriVect<-sort(apriVect)
+
+apriResultsList<-list()
+apriModList<-list()
+
+for(i in 1:length(apriVect)){
+  apr<-apriVect[i]
+  
+  datJags<-list()
+  
+  datJags$N<-nrow(dat)
+  datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+  datJags$study<-as.integer(factor(dat$Sitecountry))
+  datJags$state<-ifelse(dat$te_115==1,1,2)
+  datJags$y<-ifelse(dat$apri>=apr,1,0)
+  datJags$studyTypeHospital<-dat$studyTypeHospital
+  datJags$testReasonL<-dat$testReasonL
+  datJags$alc<-dat$alc
+  
+  randSeed<-20210615
+  set.seed(randSeed)
+  
+  jagsModel4_te115_apri <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 3000)
+  parsModel4_te115_apri<-coda.samples(model=jagsModel4_te115_apri,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=10000)
+  
+  tmp<-try(summary(parsModel4_te115_apri)$statistics,silent=TRUE)
+  tmpCI<-t(hdi(parsModel4_te115_apri))
+  tmp<-cbind(tmp,tmpCI)
+  
+  tmp<-tmp %>%
+    as.data.frame() %>%
+    mutate(
+      Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+      upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+    mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+    dplyr::select(c(Mean,CrI))
+  rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+  
+  apriModList[[paste(sep="","apri_mod_",apr)]]<-jagsModel4_te115_apri
+  apriModList[[paste(sep="","apri_samples_",apr)]]<-parsModel4_te115_apri
+  apriResultsList[[paste(sep="","apri",apr)]]<-tmp
+}
+
+save(apriResultsList,apriModList,file=paste(sep="","apriResultsList_",gsub(pattern="-",replacement="",Sys.Date()),".RData"))
+```
+
+```{r apriVectSummary, warning=F, message=F, error=FALSE, results='hide'}
+sensVect<-numeric(length(apriVect))
+specVect<-numeric(length(apriVect))
+for(i in 1:length(apriVect)){
+  sensVect[i]<-apriResultsList[[i]]["overall sensitivity","Mean"]
+  specVect[i]<-apriResultsList[[i]]["overall specificity","Mean"]
+}
+youdenJ<-sensVect+specVect-1
+
+aucSensVect<-c(1,sensVect,0)
+aucOnemSpecVect<-c(1,1-specVect,0)
+idxOrder<-order(decreasing = FALSE,aucOnemSpecVect)
+aucOnemSpecVect<-aucOnemSpecVect[idxOrder]
+aucSensVect<-aucSensVect[idxOrder]
+
+aucX<-aucOnemSpecVect[-1]-aucOnemSpecVect[-length(aucOnemSpecVect)]
+aucY<-(aucSensVect[-length(aucSensVect)]+aucSensVect[-1])/2
+auc<-sum(aucX*aucY)
+
+dfROC<-data.frame(
+  apri=apriVect,
+  sensitivity=sensVect,
+  specificity=specVect,
+  YoudenJ=youdenJ
+)
+
+idxBestYouden<-which(youdenJ==max(youdenJ))
+bestThr<-apriVect[idxBestYouden]
+bestSens<-sensVect[idxBestYouden]
+bestSpec<-specVect[idxBestYouden]
+```
+
+```{r apriPlot, fig.width=10, fig.height=10}
+dfROC %>%
+  ggplot(mapping=aes(x=1-specificity,y=sensitivity)) +
+  geom_smooth(col="orange",fill="orange",method="scam",formula = y ~ s(x, k = 5, bs = "mpi")) +
+  geom_point(alpha=1,col="darkgrey") +
+  geom_line(alpha=0.65,lwd=0.3,col="darkgrey") +
+  geom_vline(xintercept=1-bestSpec,lty=2,col="grey") +
+  geom_hline(yintercept=bestSens,lty=2,col="grey") +
+  geom_text(x=1-bestSpec,y=bestSens,label=paste(sep="","Optimum Youden J = ",format(nsmall=2,round(digits=2,max(youdenJ))),"\nAPRI threshold = ",bestThr)) +
+  labs(title=paste(sep="","ROC curve for APRI with diagnosis threshold te > 11.5kPa.\nAUC = ",format(nsmall=2,round(digits=2,auc))),caption="Bayesian bivariate random-effects models fitted for different threshold on APRI (from 0 to 13.26 according to 40 equally spaced quantiles).\nGiven the Bayesian nature of the data, there is some variability due to MCMC sampling.\nThe ROC curve (orange) is a shape-constrained generalized additive model fitted to the raw estimates (grey).\nAUC is computed from the raw estimates.") +
+  theme_light()
+
+apriResultsList[[paste(sep="","apri",bestThr)]] %>%
+  kable(caption="Best (according to Youden's J) APRI model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+## APRI with threshold 2.0, te with threshold 9.5
+
+```{r model4NoBetweenStudyEffects_apri20_te95, warning=F, message=F, error=FALSE, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+datJags$study<-as.integer(factor(dat$Sitecountry))
+datJags$state<-ifelse(dat$te_95==1,1,2)
+datJags$y<-dat$apri_20
+datJags$studyTypeHospital<-dat$studyTypeHospital
+datJags$testReasonL<-dat$testReasonL
+datJags$alc<-dat$alc
+
+randSeed<-20210615
+set.seed(randSeed)
+
+jagsModel4_te95_apri20 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 2000)
+parsModel4_te95_apri20<-coda.samples(model=jagsModel4_te95_apri20,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=5000)
+dicModel4_te95_apri20<-dic.samples(jagsModel4_te95_apri20,type="pD",n.iter=1000) 
+
+# pdf(width=10,height=10,file=paste(sep="/",outDir,"HEPSANET_jagsModel4_te95_apri20_IndivAndStudyCovariatesNoBetweenStudyEffects.pdf"))
+# plot(parsModel4_te95_apri20,auto.layout=FALSE)
+# dev.off()
+```
+
+The model-estimated overall sensitivity and specificity are given in the table below:
+
+```{r model4_apri20_te95Summary}
+tmp<-try(summary(parsModel4_te95_apri20)$statistics,silent=TRUE)
+tmpCI<-t(hdi(parsModel4_te95_apri20))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+
+tmp %>%
+  kable(caption="Model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+## APRI with threshold 1.5, te with threshold 7.9
+
+```{r model4NoBetweenStudyEffects_apri15_te79, warning=F, message=F, error=FALSE, results='hide'}
+datJags<-list()
+
+datJags$N<-nrow(dat)
+datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+datJags$study<-as.integer(factor(dat$Sitecountry))
+datJags$state<-ifelse(dat$te_79==1,1,2)
+datJags$y<-dat$apri_15
+datJags$studyTypeHospital<-dat$studyTypeHospital
+datJags$testReasonL<-dat$testReasonL
+datJags$alc<-dat$alc
+
+randSeed<-20210615
+set.seed(randSeed)
+
+jagsModel4_te79_apri15 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 2000)
+parsModel4_te79_apri15<-coda.samples(model=jagsModel4_te79_apri15,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=5000)
+dicModel4_te79_apri15<-dic.samples(jagsModel4_te79_apri15,type="pD",n.iter=1000) 
+
+# pdf(width=10,height=10,file=paste(sep="/",outDir,"HEPSANET_jagsModel4_te79_apri15_IndivAndStudyCovariatesNoBetweenStudyEffects.pdf"))
+# plot(parsModel4_te79_apri15,auto.layout=FALSE)
+# dev.off()
+```
+
+The model-estimated overall sensitivity and specificity are given in the table below:
+
+```{r model4_apri15_te79Summary}
+tmp<-try(summary(parsModel4_te79_apri15)$statistics,silent=TRUE)
+tmpCI<-t(hdi(parsModel4_te79_apri15))
+tmp<-cbind(tmp,tmpCI)
+
+tmp<-tmp %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+
+tmp %>%
+  kable(caption="Model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+## ALT with te threshold 11.5
+
+```{r altVect, warning=F, message=F, error=FALSE, results='hide'}
+altVect<-unique(quantile(dat$alt,probs=seq(0,1,length=40)))
+altVect<-c(0,altVect)
+
+altResultsList<-list()
+altModList<-list()
+
+for(i in 1:length(altVect)){
+  alt<-altVect[i]
+  
+  datJags<-list()
+  
+  datJags$N<-nrow(dat)
+  datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+  datJags$study<-as.integer(factor(dat$Sitecountry))
+  datJags$state<-ifelse(dat$te_115==1,1,2)
+  datJags$y<-ifelse(dat$alt>=alt,1,0)
+  datJags$studyTypeHospital<-dat$studyTypeHospital
+  datJags$testReasonL<-dat$testReasonL
+  datJags$alc<-dat$alc
+  
+  randSeed<-20210615
+  set.seed(randSeed)
+  
+  jagsModel4_te115_alt <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 3000)
+  parsModel4_te115_alt<-coda.samples(model=jagsModel4_te115_alt,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=10000)
+  
+  tmp<-try(summary(parsModel4_te115_alt)$statistics,silent=TRUE)
+  tmpCI<-t(hdi(parsModel4_te115_alt))
+  tmp<-cbind(tmp,tmpCI)
+  
+  tmp<-tmp %>%
+    as.data.frame() %>%
+    mutate(
+      Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+      upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+    mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+    dplyr::select(c(Mean,CrI))
+  rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+  
+  altModList[[paste(sep="","alt_mod_",alt)]]<-jagsModel4_te115_alt
+  altModList[[paste(sep="","alt_samples_",alt)]]<-parsModel4_te115_alt
+  altResultsList[[paste(sep="","alt",alt)]]<-tmp
+}
+
+save(altResultsList,altModList,file=paste(sep="","altResultsList_",gsub(pattern="-",replacement="",Sys.Date()),".RData"))
+```
+
+```{r altVectSummary, warning=F, message=F, error=FALSE, results='hide'}
+sensVect<-numeric(length(altVect))
+specVect<-numeric(length(altVect))
+for(i in 1:length(altVect)){
+  sensVect[i]<-altResultsList[[i]]["overall sensitivity","Mean"]
+  specVect[i]<-altResultsList[[i]]["overall specificity","Mean"]
+}
+youdenJ<-sensVect+specVect-1
+
+aucSensVect<-c(1,sensVect,0)
+aucOnemSpecVect<-c(1,1-specVect,0)
+idxOrder<-order(decreasing = FALSE,aucOnemSpecVect)
+aucOnemSpecVect<-aucOnemSpecVect[idxOrder]
+aucSensVect<-aucSensVect[idxOrder]
+
+aucX<-aucOnemSpecVect[-1]-aucOnemSpecVect[-length(aucOnemSpecVect)]
+aucY<-(aucSensVect[-length(aucSensVect)]+aucSensVect[-1])/2
+auc<-sum(aucX*aucY)
+
+dfROC<-data.frame(
+  alt=altVect,
+  sensitivity=sensVect,
+  specificity=specVect,
+  YoudenJ=youdenJ
+)
+
+idxBestYouden<-which(youdenJ==max(youdenJ))
+bestThr<-altVect[idxBestYouden]
+bestSens<-sensVect[idxBestYouden]
+bestSpec<-specVect[idxBestYouden]
+```
+
+```{r altPlot, fig.width=10, fig.height=10}
+dfROC %>%
+  ggplot(mapping=aes(x=1-specificity,y=sensitivity)) +
+  geom_smooth(col="orange",fill="orange",method="scam",formula = y ~ s(x, k = 5, bs = "mpi")) +
+  geom_point(alpha=1,col="darkgrey") +
+  geom_line(alpha=0.65,lwd=0.3,col="darkgrey") +
+  geom_vline(xintercept=1-bestSpec,lty=2,col="grey") +
+  geom_hline(yintercept=bestSens,lty=2,col="grey") +
+  geom_text(x=1-bestSpec,y=bestSens,label=paste(sep="","Optimum Youden J = ",format(nsmall=2,round(digits=2,max(youdenJ))),"\nALT threshold = ",bestThr)) +
+  labs(title=paste(sep="","ROC curve for ALT with diagnosis threshold te > 11.5kPa.\nAUC = ",format(nsmall=2,round(digits=2,auc))),caption="Bayesian bivariate random-effects models fitted for different threshold on ALT (from 1 to 198 according to 40 equally spaced quantiles).\nGiven the Bayesian nature of the data, there is some variability due to MCMC sampling.\nThe ROC curve (orange) is a shape-constrained generalized additive model fitted to the raw estimates (grey).\nAUC is computed from the raw estimates.") +
+  theme_light()
+
+altResultsList[[paste(sep="","alt",bestThr)]] %>%
+  kable(caption="Best (according to Youden's J) ALT model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## FIB4 with te threshold 11.5
+
+```{r fib4Vect, warning=F, message=F, error=FALSE, results='hide'}
+fib4Vect<-unique(quantile(dat$fib4,probs=seq(0,1,length=40)))
+fib4Vect<-sort(c(0,fib4Vect,6,10))
+
+fib4ResultsList<-list()
+fib4ModList<-list()
+
+for(i in 1:length(fib4Vect)){
+  fib4<-fib4Vect[i]
+  
+  datJags<-list()
+  
+  datJags$N<-nrow(dat)
+  datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+  datJags$study<-as.integer(factor(dat$Sitecountry))
+  datJags$state<-ifelse(dat$te_115==1,1,2)
+  datJags$y<-ifelse(dat$fib4>=fib4,1,0)
+  datJags$studyTypeHospital<-dat$studyTypeHospital
+  datJags$testReasonL<-dat$testReasonL
+  datJags$alc<-dat$alc
+  
+  randSeed<-20210615
+  set.seed(randSeed)
+  
+  jagsModel4_te115_fib4 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlc_simplerTestReason.jags', data=datJags, n.chains = 4, n.adapt = 3000)
+  parsModel4_te115_fib4<-coda.samples(model=jagsModel4_te115_fib4,variable.names=c('sens','spec','orGammaL','orGammaA','orLambda','reSens','reSpec'),n.iter=10000)
+  
+  tmp<-try(summary(parsModel4_te115_fib4)$statistics,silent=TRUE)
+  tmpCI<-t(hdi(parsModel4_te115_fib4))
+  tmp<-cbind(tmp,tmpCI)
+  
+  tmp<-tmp %>%
+    as.data.frame() %>%
+    mutate(
+      Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+      upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+    mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+    dplyr::select(c(Mean,CrI))
+  rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","suspected liver disease screening (OR for sensitivity)","suspected liver disease screening (OR for specificity)","hospital-based study (OR for sensitivity)","hospital-based study (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","overall sensitivity","overall specificity")
+  
+  fib4ModList[[paste(sep="","fib4_mod_",fib4)]]<-jagsModel4_te115_fib4
+  fib4ModList[[paste(sep="","fib4_samples_",fib4)]]<-parsModel4_te115_fib4
+  fib4ResultsList[[paste(sep="","fib4",fib4)]]<-tmp
+}
+
+save(fib4ResultsList,fib4ModList,file=paste(sep="","fib4ResultsList_",gsub(pattern="-",replacement="",Sys.Date()),".RData"))
+```
+
+```{r fib4VectSummary, warning=F, message=F, error=FALSE, results='hide'}
+sensVect<-numeric(length(fib4Vect))
+specVect<-numeric(length(fib4Vect))
+for(i in 1:length(fib4Vect)){
+  sensVect[i]<-fib4ResultsList[[i]]["overall sensitivity","Mean"]
+  specVect[i]<-fib4ResultsList[[i]]["overall specificity","Mean"]
+}
+youdenJ<-sensVect+specVect-1
+
+aucSensVect<-c(1,sensVect,0)
+aucOnemSpecVect<-c(1,1-specVect,0)
+idxOrder<-order(decreasing = FALSE,aucOnemSpecVect)
+aucOnemSpecVect<-aucOnemSpecVect[idxOrder]
+aucSensVect<-aucSensVect[idxOrder]
+
+aucX<-aucOnemSpecVect[-1]-aucOnemSpecVect[-length(aucOnemSpecVect)]
+aucY<-(aucSensVect[-length(aucSensVect)]+aucSensVect[-1])/2
+auc<-sum(aucX*aucY)
+
+dfROC<-data.frame(
+  fib4=fib4Vect,
+  sensitivity=sensVect,
+  specificity=specVect,
+  YoudenJ=youdenJ
+)
+
+idxBestYouden<-which(youdenJ==max(youdenJ))
+bestThr<-fib4Vect[idxBestYouden]
+bestSens<-sensVect[idxBestYouden]
+bestSpec<-specVect[idxBestYouden]
+```
+
+```{r fib4Plot, fig.width=10, fig.height=10}
+dfROC %>%
+  ggplot(mapping=aes(x=1-specificity,y=sensitivity)) +
+  geom_smooth(col="orange",fill="orange",method="scam",formula = y ~ s(x, k = 5, bs = "mpi")) +
+  geom_point(alpha=1,col="darkgrey") +
+  geom_line(alpha=0.65,lwd=0.3,col="darkgrey") +
+  geom_vline(xintercept=1-bestSpec,lty=2,col="grey") +
+  geom_hline(yintercept=bestSens,lty=2,col="grey") +
+  geom_text(x=1-bestSpec,y=bestSens,label=paste(sep="","Optimum Youden J = ",format(nsmall=2,round(digits=2,max(youdenJ))),"\nFIB4 threshold = ",bestThr)) +
+  labs(title=paste(sep="","ROC curve for FIB4 with diagnosis threshold te > 11.5kPa.\nAUC = ",format(nsmall=2,round(digits=2,auc))),caption="Bayesian bivariate random-effects models fitted for different threshold on FIB4 (from 0 to 38.35 according to 40 equally spaced quantiles).\nGiven the Bayesian nature of the data, there is some variability due to MCMC sampling.\nThe ROC curve (orange) is a shape-constrained generalized additive model fitted to the raw estimates (grey).\nAUC is computed from the raw estimates.") +
+  theme_light()
+
+fib4ResultsList[[paste(sep="","fib4",bestThr)]] %>%
+  kable(caption="Best (according to Youden's J) FIB4 model with site/study specific sensitivities and specificities (random effects).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## GPR with threshold 0.56
+
+## GPR with threshold 0.32
