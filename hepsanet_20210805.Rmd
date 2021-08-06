@@ -446,7 +446,11 @@ rm(tmp,tmpCI)
 ```
 
 ```{r fixedThrSumApri, echo=FALSE}
+<<<<<<< HEAD
+save(list=c("jagsModel4_te115_apri20","jagsModel4_te95_apri20","jagsModel4_te79_apri15","jagsModel4_te115_gpr56","jagsModel4_te95_gpr56","jagsModel4_te79_gpr32","parsModel4_te115_apri20","parsModel4_te95_apri20","parsModel4_te79_apri15","parsModel4_te115_gpr56","parsModel4_te95_gpr56","parsModel4_te79_gpr32"),file=paste(sep="","fixedThresholdModelsResultsList_",gsub(pattern="-",replacement="",Sys.Date()),".RData"))
+=======
 save(c("jagsModel4_te115_apri20","jagsModel4_te95_apri20","jagsModel4_te79_apri15","jagsModel4_te115_gpr56","jagsModel4_te95_gpr56","jagsModel4_te79_gpr32","parsModel4_te115_apri20","parsModel4_te95_apri20","parsModel4_te79_apri15","parsModel4_te115_gpr56","parsModel4_te95_gpr56","parsModel4_te79_gpr32"),file=paste(sep="","fixedThresholdModelsResultsList_",gsub(pattern="-",replacement="",Sys.Date()),".RData"))
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 
 sumFunTmp<-function(modSumTab){
   sens<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["sens","Mean"])),"%")
@@ -1827,7 +1831,11 @@ fib479ResultsList[[paste(sep="","fib4",bestThr)]] %>%
 
 ## Appendix - models for fixed thresholds on APRI and GPR
 
+<<<<<<< HEAD
+```{r model4Apri20Te115Summary}
+=======
 ```{r model4_apri20_te115Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te115_apri20 %>%
   as.data.frame() %>%
   mutate(
@@ -1842,7 +1850,11 @@ tmp %>%
   kable_styling(full_width = FALSE)
 ```
 
+<<<<<<< HEAD
+```{r model4Apri20Te95Summary}
+=======
 ```{r model4_apri20_te95Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te95_apri20 %>%
   as.data.frame() %>%
   mutate(
@@ -1857,7 +1869,11 @@ tmp %>%
   kable_styling(full_width = FALSE)
 ```
 
+<<<<<<< HEAD
+```{r model4Apri15Te79Summary}
+=======
 ```{r model4_apri15_te79Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te79_apri15 %>%
   as.data.frame() %>%
   mutate(
@@ -1872,7 +1888,11 @@ tmp %>%
   kable_styling(full_width = FALSE)
 ```
 
+<<<<<<< HEAD
+```{r model4Gpr56Te115Summary}
+=======
 ```{r model4_gpr56_te115Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te115_gpr56 %>%
   as.data.frame() %>%
   mutate(
@@ -1887,7 +1907,11 @@ tmp %>%
   kable_styling(full_width = FALSE)
 ```
 
+<<<<<<< HEAD
+```{r model4Gpr56Te95Summary}
+=======
 ```{r model4_gpr56_te95Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te95_gpr56 %>%
   as.data.frame() %>%
   mutate(
@@ -1902,7 +1926,11 @@ tmp %>%
   kable_styling(full_width = FALSE)
 ```
 
+<<<<<<< HEAD
+```{r model4Gpr32Te79Summary}
+=======
 ```{r model4_gpr32_te79Summary}
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
 tmp<-mod_te79_gpr32 %>%
   as.data.frame() %>%
   mutate(
@@ -1916,4 +1944,7 @@ tmp %>%
   kable(caption="Bivariate random effects model for GPR$\\geq0.32$ and te>7.9 (F2).",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
   kable_styling(full_width = FALSE)
 ```
+<<<<<<< HEAD
+=======
 
+>>>>>>> 6b7b01aabe3d44b774ab34a929c0701f8fffb487
