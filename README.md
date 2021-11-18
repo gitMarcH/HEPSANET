@@ -10,8 +10,8 @@ The models developed here are similar to those described here:
 
 The aim of the analysis is to get meta-analysis estimates of the operational characteristics of diagnostic tests for liver fibrosis and cirrhosis based on different biomarkers.
 
-Specifically we define 4 models, corresponding to those from [Riley et al (2008)](https://doi.org/10.1002/sim.3441).
-Each of those models is fitted several times: for each combination of reference diagnostic and experimental diagnostic.
+Specifically we focus on model 4 from [Riley et al (2008)](https://doi.org/10.1002/sim.3441).
+This model is fitted several times: for each combination of reference diagnostic and experimental diagnostic.
 
 The models are fitted using [R](https://cran.r-project.org) and [JAGS](https://mcmc-jags.sourceforge.io).
 
