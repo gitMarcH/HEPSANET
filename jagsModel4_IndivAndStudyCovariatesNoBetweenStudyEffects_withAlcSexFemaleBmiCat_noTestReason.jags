@@ -1,0 +1,70 @@
+model{
+
+# model
+for(j in 1:N){
+  y[j]~dbern(p[j])
+  
+  p[j]=ifelse(state[j]==1,exp_p[j]/(1+exp_p[j]),1-exp_p[j]/(1+exp_p[j]))
+  exp_p[j]=ifelse(exp_pTmp[j]>1e8,1e8,exp_pTmp[j]) # avoids undefined p[j]
+  exp_pTmp[j]=exp(beta[state[j]] + gammaAl[state[j]]*alc[j] + gammaS[state[j]]*sexF[j] + gammaBun[state[j]]*bmiUnder[j] + gammaBov[state[j]]*bmiOver[j] + gammaBob[state[j]]*bmiObese[j] + u[study[j],state[j]])
+  
+  alc[j]~dbern(palc)
+  sexF[j]~dbern(psex)
+  bmiUnder[j]~dbern(pBMI[1])
+  bmiOver[j]~dbern(pBMI[3])
+  bmiObese[j]~dbern(pBMI[4])
+  state[j]~dcat(pi) # allows te (and hence state) to be missing and the model will average over it
+}
+
+for(i in 2:m){
+  u[i,1:2]~dmnorm(c(0,0), Omega[1:2,1:2]) # Omega is precision matrix
+}
+u[1,1]=-sum(u[2:m,1]) # needed for model identifiability
+u[1,2]=-sum(u[2:m,2]) # needed for model identifiability
+
+# priors
+beta[1]~dnorm(0,1/100000) # same as in Riley et al (2008)
+beta[2]~dnorm(0,1/100000) # same as in Riley et al (2008)
+gammaAlTmp~dnorm(0,1/100000)
+gammaAl[1]=ifelse(gammaAlTmp>1e8,1e8,ifelse(gammaAlTmp<(-1e8),-1e8,gammaAlTmp)) # avoids undefined alcohol term if no hazardous alcohol drinkers
+gammaAl[2]~dnorm(0,1/100000)
+gammaS[1]~dnorm(0,1/100000)
+gammaS[2]~dnorm(0,1/100000)
+gammaBun[1]~dnorm(0,1/100000)
+gammaBun[2]~dnorm(0,1/100000)
+gammaBov[1]~dnorm(0,1/100000)
+gammaBov[2]~dnorm(0,1/100000)
+gammaBob[1]~dnorm(0,1/100000)
+gammaBob[2]~dnorm(0,1/100000)
+palc~dbeta(0.5,0.5)
+psex~dbeta(0.5,0.5)
+pBMI~ddirich(c(1,1,1,1))
+pi~ddirich(c(1,1))
+
+Omega[1:2,1:2]~dwish(R[1:2,1:2],2) # same as in Riley et al (2008)
+R[1,1]=1
+R[1,2]=0
+R[2,1]=0
+R[2,2]=1
+k=2
+
+# derived quantities
+sensRef=ilogit(beta[1])
+specRef=ilogit(beta[2])
+sensAvg=sum(ifelse(state==1,p,0))/sum(state==1)
+specAvg=1-sum(ifelse(state==2,p,0))/sum(state==2)
+
+orGammaAl[1]=exp(gammaAl[1])
+orGammaAl[2]=exp(gammaAl[2])
+orGammaS[1]=exp(gammaS[1])
+orGammaS[2]=exp(gammaS[2])
+orGammaBun[1]=exp(gammaBun[1])
+orGammaBun[2]=exp(gammaBun[2])
+orGammaBov[1]=exp(gammaBov[1])
+orGammaBov[2]=exp(gammaBov[2])
+orGammaBob[1]=exp(gammaBob[1])
+orGammaBob[2]=exp(gammaBob[2])
+
+reSens=Omega[2,2]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
+reSpec=Omega[1,1]/(Omega[1,1]*Omega[2,2]-Omega[1,2]*Omega[2,1]) # usual matrix inversion
+}
