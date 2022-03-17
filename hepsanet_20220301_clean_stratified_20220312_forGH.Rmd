@@ -1,0 +1,3262 @@
+---
+title: "HEPSANET analysis"
+author: "Marc Henrion"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(rjags)
+library(HDInterval)
+library(scam)
+library(MCMCvis)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(forestplot)
+library(gridExtra)
+library(knitr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE)
+
+# date stamp for output - will be fixed to the date when the script started running, even if it runs for more than 1 day
+dateStr<-gsub(pattern="-",replacement="",Sys.Date())
+
+outDir<-paste(sep="","output/",dateStr)
+if(!dir.exists(outDir)){dir.create(outDir,recursive=TRUE)}
+
+# number of cores / treads / parallel jobs
+nThread<-12 # how many parallel jobs to run; i9 in macbook has 16 threads, so would suggest 12 as a maximum here to avoid crashing things
+
+dateToLoad<-"20211108"
+
+# switches - which ones to run (the ones not run will be loaded)
+doFixedThrApri20Te122<-TRUE
+doFixedThrApri20Te95<-TRUE
+doFixedThrApri15Te79<-TRUE
+doFixedThrGpr56Te122<-TRUE
+doFixedThrGpr56Te95<-TRUE
+doFixedThrGpr32Te79<-TRUE
+
+doFixed<-ifelse(doFixedThrApri20Te122 & doFixedThrApri20Te95 & doFixedThrApri15Te79 & doFixedThrGpr56Te122 & doFixedThrGpr56Te95 & doFixedThrGpr32Te79,TRUE,FALSE)
+
+doOptApriTe122<-TRUE
+doOptApriTe95<-TRUE
+doOptApriTe79<-TRUE
+
+doOptApriFixedUlnTe122<-TRUE
+doOptApriFixedUlnTe95<-TRUE
+doOptApriFixedUlnTe79<-TRUE
+
+doOptGprTe122<-TRUE
+doOptGprTe95<-TRUE
+doOptGprTe79<-TRUE
+
+doOptGprFixedUlnTe122<-TRUE
+doOptGprFixedUlnTe95<-TRUE
+doOptGprFixedUlnTe79<-TRUE
+
+doOptAltTe122<-TRUE
+doOptAltTe95<-TRUE
+doOptAltTe79<-TRUE
+
+doOptFib4Te122<-TRUE
+doOptFib4Te95<-TRUE
+doOptFib4Te79<-TRUE
+```
+
+## Purpose of this analysis
+
+This report fits bivariate Bayesian model similar to those described in [Riley et al (2008)](https://doi.org/10.1002/sim.3441), [Reitsma et al (2005)](https://doi.org/10.1016/j.jclinepi.2005.02.022) and [Owen et al (2018)](https://doi.org/10.1016/j.jclinepi.2018.03.005) in order to get a meta-analysis estimate of the operational characteristics of diagnostic tests for liver fibrosis and cirrhosis based on different biomarkers.
+
+Below we define 4 models, corresponding to those from [Riley et al (2008)](https://doi.org/10.1002/sim.3441). Each of those models would be fit several times: for each combination of reference diagnostic and experimental diagnostic.
+
+## Reading the data extracted during the systematic review
+
+```{r readData}
+#datFile<-"../2021-06-24_RevisedData/HEPSANET_biomarker_cleaned_data.csv"
+#datFile<-"../2021-10-20_Data/HEPSANET_biomarker_cleaned_data_incmi.csv"
+datFile<-"../2021-11-11_Data/HEPSANET_biomarker_cleaned_data_incmi.csv"
+
+dat<-read.csv(datFile,stringsAsFactors = FALSE)
+
+dat<-dat %>%
+  mutate(ReasontotestHBVSCLF=gsub(pattern=" ",replacement="",case_when(ReasontotestHBVSCLF==""~"N",ReasontotestHBVSCLF=="I"~"L",TRUE~ReasontotestHBVSCLF))) %>%
+  mutate(
+    te=as.numeric(te),
+    Platelets109L=as.numeric(Platelets109L),
+    ASTULNUL=as.numeric(ASTULNUL),
+    GGTULNUL=as.numeric(GGTULNUL),
+    testReason=factor(ReasontotestHBVSCLF,levels=c("C","S","L","F","N")),
+    studyType=factor(hosp_com),
+    bmiCat=case_when(
+      BMIkgm2<18.5~"Underweight",
+      BMIkgm2>=18.5 & BMIkgm2<25~"Normal",
+      BMIkgm2>=25 & BMIkgm2<30~"Overweight",
+      BMIkgm2>=30~"Obese",
+    ),
+    sex=factor(dat$sex,levels=c("Female","Male"))
+    ) %>%
+  mutate(
+    apriFixedUln=100*(ast/40)/Platelets109L, # for numerical scale we use 40 as the same ULN for everyone
+    gprFixedUln=100*(ggt/61)/Platelets109L, # for numerical scale we use 61 as the same ULN for everyone
+    apri=100*(ast/ASTULNUL)/Platelets109L,
+    gpr=100*(ggt/GGTULNUL)/Platelets109L
+  )
+
+dat$hosp_com[dat$hosp_com==""]<-NA
+
+setOfDummyVars<-model.matrix(~studyType+testReason,data=dat)
+dat<-cbind(dat,setOfDummyVars[,-1])
+```
+
+The file `r datFile` contains `r nrow(dat)` rows / observations and `r ncol(dat)` columns / variables.
+
+Notes (as per Alex's email from 24 June 2021):
+
+* Only 2 samples (`H014`, `H009`) were the reason for testing is `F`. These have been merged with `S`.
+
+```{r dataRecoding}
+dat$testReason[dat$Nomerged %in% c("H014","H009")]<-"S"
+
+dat<-dat %>%
+  mutate(testReason=factor(as.character(testReason),levels=c("C","S","L","N")))
+```
+
+## Filtering out participants
+
+We filter out participants who are positive for hepatitis C and/or D infection using the variables `antihcv`, `hcvrna`, and `antihdv` (all participants positive for any of these are filtered out). Participants with no records for these variables are retained.
+
+```{r hepFilter}
+nBefore<-nrow(dat)
+
+dat<-dat %>%
+  filter((is.na(antihcv) | antihcv!=1) &
+           (is.na(hcvrna) | hcvrna!=1) &
+           (is.na(antihdv) |antihdv!=1))
+```
+
+This has filtered out `r nBefore-nrow(dat)` participants, leaving `r nrow(dat)` participants for the analysis.
+
+We also filter out participants with `site` set to `N`.
+
+```{r siteFilter}
+nBefore<-nrow(dat)
+
+dat$site[dat$site=="" & dat$Sitecountry==2]<-"Cape Town"
+
+dat<-dat %>%
+  filter(Sitecountry!="N")
+```
+
+This has filtered out `r nBefore-nrow(dat)` participants, leaving `r nrow(dat)` participants for the analysis.
+
+```{r summaryData}
+sumFun<-function(dat,vars,type,digs=2,na.rm=TRUE){
+  # dat = data frame to be summarised
+  # vars = character vector with variables names
+  # type = character vector of same length as vars specifying the type of summary to compute (needs to be one of "mean_sd","median_iqr","n_perc")
+  # digs = integer specifying the number of decimal digits to report (defaults to 2)
+  # na.rm = whether to remove NAs or not (defaults to TRUE)
+  
+  res<-data.frame(
+    var=character(0),
+    stat1=character(0),
+    stat2=character(0)
+  )
+  
+  for(i in 1:length(vars)){
+    if(type[i]=="mean_sd"){
+      stat1<-format(nsmall=digs,round(digits=digs,mean(dat[,vars[i]],na.rm=T)))
+      stat2<-paste(sep="","(",format(nsmall=digs,round(digits=digs,sd(dat[,vars[i]],na.rm=T))),")")
+      #varName<-paste(sep=" ",vars[i],"; mean (sd)")
+      varName<-paste(sep=" ","mean (sd)")
+      
+      res<-rbind(res,c(varName,stat1,stat2))
+      rm(varName,stat1,stat2)
+    }else if(type[i]=="median_iqr"){
+      stat1<-format(nsmall=digs,round(digits=digs,median(dat[,vars[i]],na.rm=T)))
+      stat2<-paste(sep="","(",paste(collapse=",",format(nsmall=digs,round(digits=digs,quantile(dat[,vars[i]],probs=c(0.25,0.75),na.rm=T)))),")")
+      
+      #varName<-paste(sep=" ",vars[i],"; median (IQR)")
+      varName<-paste(sep=" ","median (IQR)")
+      res<-rbind(res,c(varName,stat1,stat2))
+      rm(varName,stat1,stat2)
+    }else if(type[i]=="n_perc"){
+      for(val in sort(unique(dat[,vars[i]]))){
+        stat1<-sum(dat[,vars[i]]==val,na.rm=T)
+        stat2<-paste(sep="","(",format(nsmall=digs,round(digits=digs,100*sum(dat[,vars[i]]==val,na.rm=T)/sum(!is.na(dat[,vars[i]])))),"%)")
+        
+        #varName<-paste(sep="",vars[i],"; ",val,"; n (%)")
+        varName<-paste(sep="",val,"; n (%)")
+        res<-rbind(res,c(varName,stat1,stat2))
+        rm(varName,stat1,stat2)
+      }
+    }
+  }
+  
+  colnames(res)<-c("variable","stat1","stat2")
+  return(res)
+}
+  
+datSum<-sumFun(dat,
+               vars=c("hosp_com","site","sex","age","BMIkgm2","te","apriFixedUln","gprFixedUln","fib4","alt"),
+               type=c("n_perc","n_perc","n_perc","median_iqr","mean_sd","median_iqr","median_iqr","median_iqr","median_iqr","median_iqr","median_iqr"))
+
+datSum %>%
+  kable(caption="Patient characteristics",row.names=F) %>%
+  kable_styling(full_width=F) %>%
+  pack_rows(start_row=1,end_row=2,group_label=paste(sep="","Type of study; n = ",sum(!is.na(dat$hosp_com))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$hosp_com))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=3,end_row=13,group_label=paste(sep="","Site; n = ",sum(!is.na(dat$site))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$site))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=14,end_row=15,group_label=paste(sep="","Sex; n = ",sum(!is.na(dat$sex))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$age))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=16,end_row=16,group_label=paste(sep="","Age; n = ",sum(!is.na(dat$age))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$age))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=17,end_row=17,group_label=paste(sep="","BMI; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=18,end_row=18,group_label=paste(sep="","Transient elastography; n = ",sum(!is.na(dat$te))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$te))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=19,end_row=19,group_label=paste(sep="","APRI (AST to platelet ratio); n = ",sum(!is.na(dat$apriFixedUln))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$apriFixedUln))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=20,end_row=20,group_label=paste(sep="","GPR (GGT to platelet ratio); n = ",sum(!is.na(dat$gprFixedUln))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$gprFixedUln))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=21,end_row=21,group_label=paste(sep="","Fibrosis 4 score; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)")) %>%
+  pack_rows(start_row=22,end_row=22,group_label=paste(sep="","ALT; n = ",sum(!is.na(dat$bmi))," (",format(nsmall=1,round(digits=1,100*sum(!is.na(dat$bmi))/nrow(dat))),"%)"))
+```
+
+
+## Definiton of the gold standard diagnosis
+
+Reference standards (which are assumed to be gold standards) are based on variable `te`, transient elastrography result. Specifically:
+
+* Cirrhosis (F4) if $te>12.2kPa$ (sensitivity analysis $te>9.5kPa$)
+* Significant fibrosis (F2) if $te>7.9kPa$
+
+In the dataset, these 3 gold standards are encoded by variables `te_122`, `te_95` and `te_79`.
+
+```{r defineVarsGold}
+dat<-dat %>%
+  mutate(
+    te_125=ifelse(te>12.5,1,0),
+    te_122=ifelse(te>12.2,1,0),
+    te_115=ifelse(te>11.5,1,0),
+    te_95=ifelse(te>9.5,1,0),
+    te_79=ifelse(te>7.9,1,0),
+  )
+```
+
+## Diagnostics to be evaluated
+
+* `apri` - AST to platelet ratio index. For F4 use threshold of $\geq 2.0$ and for F2 use $\geq 1.5$. In the dataset, these 2 experimental diagnostics are encoded by variables `apri_20` and `apri_15`. Note: we will also derive an optimum threshold.
+
+* `gpr` - GGT to platelet ratio. For F4 use threshold $\geq 0.56$ and for F2 use $\geq 0.32$. In the dataset, these 2 experimental diagnostics are encoded by variables `gpr_56` and `gpr_32`.
+
+* `fib4` - fibrosis 4 score. We need to derive a score for this; no a prior defined threshold.
+
+* `alt` - ALT. We need to derive a score for this; no a priori defined threshold.
+
+
+Note: APRI and GPR always use fixed ULN (40 for APRI, 61 for GPR) in this document.
+
+
+```{r defineVarsEval}
+dat<-dat %>%
+  mutate(
+    apri_20=ifelse(apriFixedUln>=2,1,0),
+    apri_15=ifelse(apriFixedUln>=1.5,1,0),
+    gpr_56=ifelse(gprFixedUln>=0.56,1,0),
+    gpr_32=ifelse(gprFixedUln>=0.32,1,0),
+  )
+```
+
+## Very naive analysis (to get feel for data)
+
+Let's just assume we could analyse all individual-level data as is, simply pulling out the sensitivity, specificity rather than fitting a model that considers random effects and individual- and study-level covariates.
+
+```{r naiveSensSpec}
+gr<-rbind(
+  c(12.2,"2.0","0.56"),
+  c(9.5,"2.0","0.56"),
+  c(7.9,"1.5","0.32")
+)
+
+rnames<-character(0)
+for(s in c("All",sort(unique(dat$Sitecountry)))){
+  for(i in 1:3){
+    rnames<-c(rnames,paste(sep="_",paste(sep="","Site",s),paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))))
+  }
+}
+rnames<-gsub(rnames,pattern="SiteAll",replacement="All")
+
+sensSpecMat<-matrix(nrow=3*(length(unique(dat$Sitecountry))+1),ncol=8)
+rownames(sensSpecMat)<-rnames
+colnames(sensSpecMat)<-c("site","te","apri","gpr","apri_sens","apri_spec","gpr_sens","gpr_spec")
+sensSpecMat<-as.data.frame(sensSpecMat)
+
+for(s in c("All",sort(unique(dat$Sitecountry)))){
+  if(s=="All"){
+    datTmp<-dat
+  }else{
+    datTmp<-dat %>% filter(Sitecountry==s)
+    s<-paste(sep="","Site",s)
+  }
+    
+  for(i in 1:nrow(gr)){
+    gthr<-gr[i,1]
+    thr1<-gr[i,2]
+    thr2<-gr[i,3]
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"site"]<-gsub(s,pattern="Site",replacement="")
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"te"]<-gthr
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri"]<-thr1
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr"]<-thr2
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri_sens"]<-mean(datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==1,paste(sep="_","apri",gsub(thr1,pattern="\\.",replacement=""))],na.rm=T)
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr_sens"]<-mean(datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==1,paste(sep="_","gpr",gsub(thr2,pattern="0\\.",replacement=""))],na.rm=T)
+    
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"apri_spec"]<-mean(1-datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==0,paste(sep="_","apri",gsub(thr1,pattern="\\.",replacement=""))],na.rm=T)
+    sensSpecMat[paste(sep="_",s,paste(collapse="_",paste(sep="",c("te","apri","gpr"),gr[i,]))),"gpr_spec"]<-mean(1-datTmp[datTmp[,paste(sep="_","te",gsub(gthr,pattern="\\.",replacement=""))]==0,paste(sep="_","gpr",gsub(thr2,pattern="0\\.",replacement=""))],na.rm=T)
+    
+  }
+}
+
+sensSpecMatKable<-sensSpecMat
+for(i in 1:nrow(sensSpecMat)){
+  for(j in 5:ncol(sensSpecMat)){
+    if(!is.na(sensSpecMat[i,j])){
+      sensSpecMatKable[i,j]<-paste(sep="",format(nsmall=1,round(digits=1,100*sensSpecMat[i,j])),"%")
+    }else{
+      sensSpecMatKable[i,j]<-"-"
+    }
+  }
+}
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te12.2_apri2.0_gpr0.56")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te12.2_apri2.0_gpr0.56")],pattern="_te12.2_apri2.0_gpr0.56",replacement="; te > 12.2 (apri > 2.0, gpr > 0.56)")
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te9.5_apri2.0_gpr0.56")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te9.5_apri2.0_gpr0.56")],pattern="_te9.5_apri2.0_gpr0.56",replacement="; te > 9.5 (apri > 2.0, gpr > 0.56)")
+rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te7.9_apri1.5_gpr0.32")]<-gsub(rownames(sensSpecMatKable)[grepl(rownames(sensSpecMatKable),pattern="_te7.9_apri1.5_gpr0.32")],pattern="_te7.9_apri1.5_gpr0.32",replacement="; te > 7.9 (apri > 1.5, gpr > 0.32)")
+
+sensSpecMatKable <- cbind("",sensSpecMatKable)
+
+sensSpecMatKable %>%
+  dplyr::select(!site) %>%
+  kable(caption="Naive sensitivity and specificity estimates (expressed as percentages).",col.names=c(" ","TE","APRI","GPR","Sensitivity","Specificity","Sensitivity","Specificity"),row.names = FALSE) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c(" "=1,"Diagnostic thresholds"=3,"APRI"=2,"GPR"=2)) %>%
+  pack_rows(start_row=1,end_row=3,group_label="All samples") %>%
+  pack_rows(start_row=4,end_row=6,group_label="Site 1") %>%
+  pack_rows(start_row=7,end_row=9,group_label="Site 10") %>%
+  pack_rows(start_row=10,end_row=12,group_label="Site 11") %>%
+  pack_rows(start_row=13,end_row=15,group_label="Site 2") %>%
+  pack_rows(start_row=16,end_row=18,group_label="Site 3") %>%
+  pack_rows(start_row=19,end_row=21,group_label="Site 4") %>%
+  pack_rows(start_row=22,end_row=24,group_label="Site 5") %>%
+  pack_rows(start_row=25,end_row=27,group_label="Site 6") %>%
+  pack_rows(start_row=28,end_row=30,group_label="Site 7") %>%
+  pack_rows(start_row=31,end_row=33,group_label="Site 8") %>%
+  pack_rows(start_row=34,end_row=36,group_label="Site 9")
+```
+
+Sensitivity and specificity are extremely variable from study to study. This is difficult to understand: you would expect some heterogeneity due to how certain diagnostics are delivered, some underlying characteristics that impact test results which vary from population to population, but not quite to this extent. Positive and negative predictive values can vary a lot from one population to another, but that is because these, unlike sensitivity and specificity, depend on the prevalence of the condition under investigation.
+
+
+## Stratification by liver disease suspicion
+
+While developing the modelling framework, we realised that reason for testing had a substantial effect on sensitivity and specificity.
+
+We decided to stratify by testing reason, specifically whether participants were tested because of suspected liver disease or for other reasons (predominantly routine and community screenings).
+
+```{r stratification}
+datL<-dat %>% dplyr::filter(testReasonL==1)
+datS<-dat %>% dplyr::filter(testReasonL==0)
+```
+
+There are `r nrow(datS)` observations from community, routine or unspecified screenings and `r nrow(datL)` observations from suspected liver disease screenings.
+
+
+## Model
+
+Earlier versions of this document (20210627 and earlier) compared several different models. From this, the decision was made for a model with individual- and study-level covariates and study-specific random effects
+
+This is model (4) from [Riley et al (2008)](https://doi.org/10.1002/sim.3441).
+
+This model estimates summary sensitivity and specificity with study random effects and individual- and study-level covariates.
+
+We will stratify our analyses by testing reason: specifically we consider i) community-based / routine or undocumented reason for testing and ii) suspected liver disease testing reason separately. 
+
+We include the following co-variates:
+
+* BMI (categorised into underweight, normal [default], overweight and obese)
+* sex (male [default] or female)
+* hazardous alcohol drinking (no [default] or yes)
+
+```{r fitFunctions}
+fitModel<-function(dat,state,y,randSeed=20210615,nAdapt=2500,nIter=5000,nChains=4){
+  datJags<-list()
+  
+  datJags$N<-nrow(dat)
+  datJags$m<-max(as.integer(factor(dat$Sitecountry)))
+  datJags$study<-as.integer(factor(dat$Sitecountry))
+  datJags$state<-state
+  datJags$y<-y
+  datJags$alc<-dat$alc
+  datJags$sexF<-ifelse(dat$sex=="Female",1,0)
+  #datJags$age<-dat$age-median(dat$age)
+  datJags$bmiUnder<-ifelse(dat$bmiCat=="Underweight",1,0)
+  datJags$bmiOver<-ifelse(dat$bmiCat=="Overweight",1,0)
+  datJags$bmiObese<-ifelse(dat$bmiCat=="Obese",1,0)
+
+  set.seed(randSeed)
+  
+  jagsModel4 <- jags.model('jagsModel4_IndivAndStudyCovariatesNoBetweenStudyEffects_withAlcSexFemaleBmiCat_noTestReason.jags', data=datJags, n.chains = nChains, n.adapt = nAdapt)
+  parsModel4<-coda.samples(model=jagsModel4,variable.names=c('sensRef','specRef','sensAvg','specAvg','orGammaAl','orGammaS','orGammaBun','orGammaBov','orGammaBob','reSens','reSpec'),n.iter = nIter, na.rm=FALSE)
+  
+  return(list(jagsModel4=jagsModel4,parsModel4=parsModel4))
+}
+
+fitModelsPar<-function(nThread=nThread,parVect,yVar,dat,state,randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4){
+  cl <- parallel::makeCluster(nThread)
+  doParallel::registerDoParallel(cl)
+  
+  parList<-foreach(i=1:length(parVect),.packages=c("rjags","HDInterval","dplyr"),.export=c("fitModel")) %dopar% {
+    thr<-parVect[i]
+    y<-ifelse(dat[,yVar]>=thr,1,0)
+    
+    mod<-fitModel(dat=dat,y=y,state=state,randSeed=randSeed,nAdapt=nAdapt,nIter=nIter,nChains=nChains)
+    
+    resultsModel4<-try(summary(mod$parsModel4)$statistics,silent=TRUE)
+    resultsModel4<-cbind(resultsModel4,t(hdi(mod$parsModel4)))
+    
+    resultsModel4 <- resultsModel4 %>%
+      as.data.frame() %>%
+      mutate(
+        Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+        upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+      mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+      dplyr::select(c(Mean,CrI))
+    rownames(resultsModel4)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)")
+    
+    list(model=mod$jagsModel4,pars=mod$parsModel4,results=resultsModel4)
+  }
+  
+  parallel::stopCluster(cl)
+  
+  return(parList)
+}
+```
+
+```{r summaryAndPlotFunction}
+sumPlotFun<-function(parVect,yVar,yVarAnnot,teThr,teThrAnnot,outDir,dateStr,xlim=2){
+  sensVect<-numeric(length(parVect))
+  specVect<-numeric(length(parVect))
+  ppvVect<-numeric(length(parVect))
+  npvVect<-numeric(length(parVect))
+  
+  for(i in 1:length(parVect)){
+    sensVect[i]<-resultList[[yVar]][[teThr]][[i]]["sensitivity (pop. average)","Mean"]
+    specVect[i]<-resultList[[yVar]][[teThr]][[i]]["specificity (pop. average)","Mean"]
+    ppvVect[i]<-resultList[[yVar]][[teThr]][[i]]["PPV (pop. average)","Mean"]
+    npvVect[i]<-resultList[[yVar]][[teThr]][[i]]["NPV (pop. average)","Mean"]
+  }
+  youdenJ<-sensVect+specVect-1
+  
+  aucSensVect<-c(1,sensVect,0)
+  aucOnemSpecVect<-c(1,1-specVect,0)
+  idxOrder<-order(decreasing = FALSE,aucOnemSpecVect)
+  aucOnemSpecVect<-aucOnemSpecVect[idxOrder]
+  aucSensVect<-aucSensVect[idxOrder]
+  
+  aucX<-aucOnemSpecVect[-1]-aucOnemSpecVect[-length(aucOnemSpecVect)]
+  aucY<-(aucSensVect[-length(aucSensVect)]+aucSensVect[-1])/2
+  auc<-sum(aucX*aucY)
+  
+  dfROC<-data.frame(
+    thr=parVect,
+    sensitivity=sensVect,
+    specificity=specVect,
+    YoudenJ=youdenJ
+  )
+  
+  idxBestYouden<-which(youdenJ==max(youdenJ))
+  bestThr<-parVect[idxBestYouden]
+  bestSens<-sensVect[idxBestYouden]
+  bestSpec<-specVect[idxBestYouden]
+  
+  dfROC<-dfROC %>%
+    mutate(
+      sensLow=NA,
+      sensUpp=NA,
+      specLow=NA,
+      specUpp=NA
+    )
+  
+  for(i in 1:nrow(dfROC)){
+    sensCrI<-as.numeric(unlist(strsplit(split=",",gsub(pattern="\\(|\\)",replacement="",resultList[[yVar]][[teThr]][[i]]["sensitivity (pop. average)","CrI"]))))
+    specCrI<-as.numeric(unlist(strsplit(split=",",gsub(pattern="\\(|\\)",replacement="",resultList[[yVar]][[teThr]][[i]]["specificity (pop. average)","CrI"]))))
+    
+    dfROC$sensLow[i]<-sensCrI[1]
+    dfROC$sensUpp[i]<-sensCrI[2]
+    dfROC$specLow[i]<-specCrI[1]
+    dfROC$specUpp[i]<-specCrI[2]
+  }
+  
+  ruleIn_90_idx<-min(which(dfROC$specificity>=0.9))
+  ruleIn_95_idx<-min(which(dfROC$specificity>=0.95))
+  ruleOut_70_idx<-max(which(dfROC$sensitivity>=0.7))
+  ruleOut_80_idx<-max(which(dfROC$sensitivity>=0.8))
+  
+  ruleIn90Thr<-parVect[ruleIn_90_idx]
+  ruleIn95Thr<-parVect[ruleIn_95_idx]
+  ruleOut70Thr<-parVect[ruleOut_70_idx]
+  ruleOut80Thr<-parVect[ruleOut_80_idx]
+  
+  png(width=16,height=9,units="in",res=300,file=paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+  g<-dfROC %>% ggplot() +
+    geom_point(mapping=aes(x=thr,y=sensitivity,ymin=sensLow,ymax=sensUpp),col="orange",size=2) +
+    geom_line(mapping=aes(x=thr,y=sensitivity,ymin=sensLow,ymax=sensUpp),col="orange",lwd=1) +
+    geom_ribbon(mapping=aes(x=thr,y=sensitivity,ymin=sensLow,ymax=sensUpp),fill="orange",alpha=0.25) +
+    geom_point(mapping=aes(x=thr,y=specificity,ymin=specLow,ymax=specUpp),col="steelblue",size=2) +
+    geom_line(mapping=aes(x=thr,y=specificity,ymin=specLow,ymax=specUpp),col="steelblue",lwd=1) +
+    geom_ribbon(mapping=aes(x=thr,y=specificity,ymin=specLow,ymax=specUpp),fill="steelblue",alpha=0.25) +
+    geom_text(x=xlim,y=0.9,label=paste(sep="","Rule-in threshold with specificity>0.9: ",yVarAnnot," >=",dfROC$thr[ruleIn_90_idx]," (sens. = ",format(nsmall=2,round(digits=2,dfROC$sensitivity[ruleIn_90_idx])),")"),col="steelblue",hjust=1,vjust=1) +
+    geom_text(x=xlim,y=0.95,label=paste(sep="","Rule-in threshold with specificity>0.95: ",yVarAnnot," >=",dfROC$thr[ruleIn_95_idx]," (sens. = ",format(nsmall=2,round(digits=2,dfROC$sensitivity[ruleIn_95_idx])),")"),col="steelblue",hjust=1,vjust=1) +
+    geom_text(x=xlim,y=0.7,label=paste(sep="","Rule-out threshold with sensitivity>0.7: ",yVarAnnot," <",dfROC$thr[ruleOut_70_idx]," (spec. = ",format(nsmall=2,round(digits=2,dfROC$specificity[ruleOut_70_idx])),")"),col="orange",hjust=1,vjust=1) +
+    geom_text(x=xlim,y=0.8,label=paste(sep="","Rule-out threshold with sensitivity>0.8: ",yVarAnnot," <",dfROC$thr[ruleOut_80_idx]," (spec. = ",format(nsmall=2,round(digits=2,dfROC$specificity[ruleOut_80_idx])),")"),col="orange",hjust=1,vjust=1) +
+    theme_light() +
+    labs(title=paste(sep="","Sensitivity (orange) and specificity (blue) as a function of ",yVarAnnot," (for te > ",teThrAnnot,").",caption="Orange = sensitivity, blue = specificity.")) +
+    scale_x_continuous(limits=c(0,xlim),name=yVarAnnot) +
+    scale_y_continuous(limits=c(0,1),name="") +
+    geom_hline(yintercept=0.9,lty=2,col="steelblue",lwd=1,alpha=0.5) +
+    geom_hline(yintercept=0.95,lty=3,col="steelblue",lwd=1,alpha=0.5) +
+    geom_hline(yintercept=0.7,lty=2,col="orange",lwd=1,alpha=0.5) +
+    geom_hline(yintercept=0.8,lty=3,col="orange",lwd=1,alpha=0.5) +
+    geom_vline(xintercept=bestThr,lty=2,col="darkgrey",lwd=1,alpha=0.5) +
+    geom_text(x=bestThr,y=0,col="darkgrey",label=paste(sep="","Youden J threshold (",yVarAnnot," >= ",bestThr,")"),hjust=0,vjust=0)
+  
+  print(g)
+  dev.off()
+  
+  pdf(width=16,height=9,file=paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".pdf"))
+  print(g)
+  dev.off()
+  
+  png(width=16,height=9,units="in",res=300,file=paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+  g<-dfROC %>%
+    ggplot(mapping=aes(x=1-specificity,y=sensitivity)) +
+    geom_smooth(col="orange",fill="orange",method="scam",formula = y ~ s(x, k = 5, bs = "mpi")) +
+    geom_point(alpha=1,col="darkgrey") +
+    geom_line(alpha=0.65,lwd=0.3,col="darkgrey") +
+    geom_vline(xintercept=1-bestSpec,lty=2,col="grey") +
+    geom_hline(yintercept=bestSens,lty=2,col="grey") +
+    geom_text(x=1-bestSpec,y=bestSens,label=paste(sep="","Optimum Youden J = ",format(nsmall=2,round(digits=2,max(youdenJ))),"\n",yVarAnnot," threshold = ",bestThr)) +
+    labs(title=paste(sep="","ROC curve for ",yVarAnnot," with diagnosis threshold te > ",teThrAnnot,".\nAUC = ",format(nsmall=2,round(digits=2,auc))),caption=paste(sep="","Bayesian bivariate random-effects models fitted for different threshold on ",yVarAnnot," (from ",parVect[1]," to ",parVect[length(parVect)]," according to ",length(parVect)," equally spaced quantiles).\nGiven the Bayesian nature of the data, there is some variability due to MCMC sampling.\nThe ROC curve (orange) is a shape-constrained generalized additive model fitted to the raw estimates (grey).\nAUC is computed from the raw estimates.")) +
+    theme_light()
+  print(g)
+  dev.off()
+  
+  pdf(width=16,height=9,file=paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".pdf"))
+  print(g)
+  dev.off()
+  
+  return(list(auc=auc,bestThr=bestThr,ruleIn90Thr=ruleIn90Thr,ruleIn95Thr=ruleIn95Thr,ruleOut70Thr=ruleOut70Thr,ruleOut80Thr=ruleOut80Thr,sensVect=sensVect,specVect=specVect,ppvVect=ppvVect,npvVect=npvVect))
+}
+```
+
+```{r helperFunctionForForestPlots}
+doForest<-function(dat,outFile,marker,teThr,bestThr,outDir,dateStr){
+  markerForPlotFile<-marker
+  marker<-gsub(marker,pattern="_[LS]$",replacement="")
+  
+  datSumForest<-dat %>%
+    group_by(site) %>%
+    filter(!is.na(get(marker))) %>%
+    summarise(
+      n=n(),
+      nWithCompleteData=sum(!is.na(te) & !is.na(get(marker)) & !is.na(testReasonL) & !is.na(studyTypeHospital) & !is.na(alc)),
+      nTePos=sum(te>teThr,na.rm=T),
+      propTePos=format(nsmall=4,round(digits=4,mean(te>teThr,na.rm=T))),
+      nMarkerPos=sum(get(marker)>bestThr,na.rm=T),
+      TP=sum(te>teThr & get(marker)>=bestThr,na.rm=T),
+      FN=sum(te>teThr & get(marker)<bestThr,na.rm=T),
+      FP=sum(te<=teThr & get(marker)>=bestThr,na.rm=T),
+      TN=sum(te<=teThr & get(marker)<bestThr,na.rm=T)
+    ) %>%
+    mutate(
+      sens=TP/(TP+FN),
+      sensCI=NA,
+      sensLower=NA,
+      sensUpper=NA,
+      spec=TN/(FP+TN),
+      specCI=NA,
+      specLower=NA,
+      specUpper=NA,
+      issum=FALSE
+    )
+  
+  for(j in 1:nrow(datSumForest)){
+    if(datSumForest$TP[j]+datSumForest$FN[j]>0){
+      datSumForest$sensCI[j]=paste(sep="","(",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(x=datSumForest$TP[j],n=datSumForest$TP[j]+datSumForest$FN[j])$conf.int))),")")
+      datSumForest$sensLower[j]=binom.test(x=datSumForest$TP[j],n=datSumForest$TP[j]+datSumForest$FN[j])$conf.int[1]
+      datSumForest$sensUpper[j]=binom.test(x=datSumForest$TP[j],n=datSumForest$TP[j]+datSumForest$FN[j])$conf.int[2]
+    }
+    if(datSumForest$FP[j]+datSumForest$TN[j]>0){
+      datSumForest$specCI[j]=paste(sep="","(",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(x=datSumForest$TN[j],n=datSumForest$FP[j]+datSumForest$TN[j])$conf.int))),")")
+      datSumForest$specLower[j]=binom.test(x=datSumForest$TN[j],n=datSumForest$FP[j]+datSumForest$TN[j])$conf.int[1]
+      datSumForest$specUpper[j]=binom.test(x=datSumForest$TN[j],n=datSumForest$FP[j]+datSumForest$TN[j])$conf.int[2]
+    }
+  }
+  
+  sumForest <- data.frame(
+    site="Summary",
+    n=sum(datSumForest$n), 
+    nWithCompleteData=sum(datSumForest$nWithCompleteData),
+    nTePos=sum(datSumForest$nTePos),
+    propTePos=format(nsmall=4,round(digits=4,sum(datSumForest$nTePos)/sum(datSumForest$n))),
+    nMarkerPos=sum(datSumForest$nMarkerPos),
+    TP=sum(datSumForest$TP),
+    FN=sum(datSumForest$FN),
+    FP=sum(datSumForest$FP),
+    TN=sum(datSumForest$TN),
+    sens = round(digits=4,bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["sensitivity (pop. average)","Mean"]),
+    sensCI = bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["sensitivity (pop. average)","CrI"],
+    sensLower=as.numeric(gsub(pattern="\\(",replacement="",unlist(strsplit(split=",",bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["sensitivity (pop. average)","CrI"]))[1])),
+    sensUpper=as.numeric(gsub(pattern="\\)",replacement="",unlist(strsplit(split=",",bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["sensitivity (pop. average)","CrI"]))[2])),
+    spec = round(digits=4,bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["specificity (pop. average)","Mean"]),
+    specCI = bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["specificity (pop. average)","CrI"],
+    specLower=as.numeric(gsub(pattern="\\(",replacement="",unlist(strsplit(split=",",bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["specificity (pop. average)","CrI"]))[1])),
+    specUpper=as.numeric(gsub(pattern="\\)",replacement="",unlist(strsplit(split=",",bestModels[[markerForPlotFile]][[paste(sep="","te",10*teThr)]]["specificity (pop. average)","CrI"]))[2])),
+    issum = TRUE)
+  
+  sumForestHeader <- data.frame(
+    site = c("","Site"),
+    n = c("n","(all)"),
+    nWithCompleteData=c("n","(complete data)"),
+    nTePos=c("n",paste(sep="","(te > ",teThr,")")),
+    propTePos=c("prop",paste(sep="","(te > ",teThr,")")),
+    nMarkerPos=c("n",paste(sep="","(",toupper(marker),">=",bestThr,")")),
+    TP=c("","TP"),
+    FN=c("","FN"),
+    FP=c("","FP"),
+    TN=c("","TN"),
+    sens=c("sensitivity",""),
+    sensCI = c("sensitivity","(95% CI)"),
+    spec=c("specificity",""),
+    specCI = c("specificity","(95% CI)"),
+    issum = TRUE)
+  
+  sumForestEmpty <- data.frame(mean = NA_real_)
+  
+  datSumForest<-datSumForest %>%
+    mutate(
+      n=as.character(n),
+      nWithCompleteData=as.character(nWithCompleteData),
+      nTePos=as.character(nTePos),
+      propTePos=as.character(propTePos),
+      nMarkerPos=as.character(nMarkerPos),
+      TP=as.character(TP),
+      FN=as.character(FN),
+      FP=as.character(FP),
+      TN=as.character(TN),
+      sens=format(nsmall=2,round(digits=2,(sens))),
+      spec=format(nsmall=2,round(digits=2,(spec)))
+    )
+  
+  sumForest<-sumForest %>%
+    mutate(
+      n=as.character(n),
+      nWithCompleteData=as.character(nWithCompleteData),
+      nTePos=as.character(nTePos),
+      propTePos=as.character(propTePos),
+      nMarkerPos=as.character(nMarkerPos),
+      TP=as.character(TP),
+      FN=as.character(FN),
+      FP=as.character(FP),
+      TN=as.character(TN),
+      sens=format(nsmall=4,round(digits=4,(sens))),
+      spec=format(nsmall=4,round(digits=4,(spec)))
+    )
+  
+  forestOut <- bind_rows(sumForestHeader,
+                         datSumForest,
+                         #sumForestEmpty,
+                         sumForest)
+  
+  forestOut$sens[is.nan(forestOut$sens) | grepl(forestOut$sens,pattern="NaN")]<-NA
+  
+  gSens<-grid.grabExpr(print(forestOut %>%
+    mutate(
+      mean=as.numeric(sens),
+      lower=sensLower,
+      upper=sensUpper
+    ) %>%
+    dplyr::select(site,n,nTePos,nMarkerPos,TP,FN,FP,TN,sens,sensCI,mean,lower,upper) %>%
+    as_tibble() %>%
+    forestplot(
+      labeltext=c(site,n,nTePos,nMarkerPos,TP,FN,FP,TN,sens,sensCI),
+      is.summary = forestOut$issum,
+      col = fpColors(box = "royalblue",
+                     line = "darkblue",
+                     summary = "royalblue"),
+      graphwidth=unit(6,"cm"),
+      clip=c(0,1))
+  ))  
+    
+  gSpec<-grid.grabExpr(print(forestOut %>%
+    mutate(
+      mean=as.numeric(spec),
+      lower=specLower,
+      upper=specUpper
+    ) %>%
+    dplyr::select(spec,specCI,mean,lower,upper) %>%
+    as_tibble() %>%
+    forestplot(
+      labeltext=c(spec,specCI),
+      is.summary = forestOut$issum,
+      col = fpColors(box = "royalblue",
+                     line = "darkblue",
+                     summary = "royalblue"),
+      graphwidth=unit(6,"cm"),
+      clip=c(0,1))
+  ))
+  
+  png(width=19,height=8,units="in",res=300,file=paste(sep="",outDir,"/forestPlot_",str_to_title(markerForPlotFile),"_Te",10*teThr,"_",dateStr,".png"))
+  grid.arrange(gSens,gSpec,nrow=1,widths=c(13.5,5.5))
+  dev.off()
+  
+  pdf(width=19,height=8,file=paste(sep="",outDir,"/forestPlot_",str_to_title(markerForPlotFile),"_Te",10*teThr,"_",dateStr,".pdf"))
+  grid.arrange(gSens,gSpec,nrow=1,widths=c(13.5,5.5))
+  dev.off()
+}
+
+pvsFromSensSpec<-function(p,sens,spec){
+  ppv<-sens*p/(sens*p + (1-spec)*(1-p))
+  npv<-spec*(1-p)/(spec*(1-p) + (1-sens)*p)
+  
+  return(data.frame(ppv=ppv,npv=npv))
+}
+
+addPVstoMCMC<-function(mcmcObj,dat){
+  for(j in 1:length(mcmcObj)){
+    tmpPVs<-pvsFromSensSpec(p=mean(dat$te_122==1,na.rm=TRUE),sens=as.numeric(mcmcObj[[j]][,"sensAvg"]),spec=as.numeric(mcmcObj[[j]][,"specAvg"]))
+    nc<-ncol(mcmcObj[[j]])
+    mcmcObj[[j]]<-cbind(mcmcObj[[j]],NA,NA)
+    colnames(mcmcObj[[j]])[(nc+1):(nc+2)]<-c("ppvAvg","npvAvg")
+    mcmcObj[[j]][,"ppvAvg"]<-tmpPVs$ppv
+    mcmcObj[[j]][,"npvAvg"]<-tmpPVs$npv
+    rm(tmpPVs,nc)
+    mcmcObj[[j]]<-as.mcmc(mcmcObj[[j]])
+  }
+
+  return(mcmcObj)
+}
+
+redoMcmcSummary<-function(modObj,resObj,yVar,teThr,parVect,dat){
+  for(pars in parVect){
+    mod[[paste(sep="_",yVar,"samples",pars)]]<-addPVstoMCMC(mod[[paste(sep="_",yVar,"samples",pars)]],dat=dat)
+    
+    tmp<-try(summary(mod[[paste(sep="_",yVar,"samples",pars)]])$statistics,silent=TRUE)
+    tmpCI<-t(hdi(mod[[paste(sep="_",yVar,"samples",pars)]]))
+    resultsModel4<-cbind(tmp,tmpCI)
+    
+    resultsModel4 <- resultsModel4 %>%
+      as.data.frame() %>%
+      mutate(
+        Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+        upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+      mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+      dplyr::select(c(Mean,CrI))
+    rownames(resultsModel4)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+    
+    resObj[[paste(sep="",yVar,pars)]]<-resultsModel4
+    rm(resultsModel4)
+  }
+  return(resObj)
+}
+
+logit<-function(p){log(p/(1-p))}
+invLogit<-function(x){exp(x)/(1+exp(x))}
+
+predictSensSpecFromModel<-function(parVect,mcmcSamples,outFile="sensSpecFacetPlots.png",prefix="apriFixedUln_samples",loadFile=NULL,saveFile=NULL,xlims=NULL){
+  if(is.null(loadFile)){
+    newDat<-expand.grid(
+      0:1,
+      0:1,
+      0:1,
+      0:1,
+      0:1
+    )
+    newDat<-newDat[rowSums(newDat[,2:4])<=1,]
+    newDat<-cbind(1,newDat)
+    colnames(newDat)<-c("Intercept","Alc","BMIob","BMIov","BMIun","SexF")
+    
+    for(j in 1:nrow(newDat)){
+      for(thr in parVect){
+        #print(c(j,thr))
+        if(thr==parVect[[1]]){
+          parDf<-rbind(cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]]))))
+        }else{
+          parDf<-rbind(parDf,
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$reSens),int1=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$sensRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]]))))
+        }
+      }
+      
+      parDf<-parDf %>%
+        dplyr::select(c(thr,sd,contains("1")))
+      
+      predDatSens<-data.frame(parDf,newDat[j,],sens=invLogit(t(rnorm(nrow(parDf),sd=parDf$sd) + as.numeric(newDat[j,]) %*% t(parDf[,-(1:2)]))))
+      
+      for(thr in parVect){
+        if(thr==parVect[[1]]){
+          parDf<-rbind(cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]]))))
+        }else{
+          parDf<-rbind(parDf,
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[2]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[3]]))),
+                       cbind(thr,sd=sqrt(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[1]])$reSpec),int2=logit(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]])$specRef),log(as.data.frame(mcmcSamples[[paste(sep="_",prefix,thr)]][[4]]))))
+        }
+      }
+      
+      parDf<-parDf %>%
+        dplyr::select(c(thr,sd,contains("2")))
+      
+      predDatSpec<-data.frame(parDf,newDat[j,],spec=invLogit(t(rnorm(nrow(parDf),sd=parDf$sd) + as.numeric(newDat[j,]) %*% t(parDf[,-(1:2)]))))
+      
+      
+      if(j==1){
+        predDatAll<-cbind(predDatSens,predDatSpec)
+      }else{
+        predDatAll<-rbind(predDatAll,cbind(predDatSens,predDatSpec))
+      }
+    }
+    colnames(predDatAll)[colnames(predDatAll)=="sd"]<-paste(sep="","sd.",1:sum(colnames(predDatAll)=="sd"))  
+    colnames(predDatAll)[colnames(predDatAll)=="thr"]<-paste(sep="","thr.",1:sum(colnames(predDatAll)=="thr"))  
+    colnames(predDatAll)[colnames(predDatAll)=="Intercept"]<-paste(sep="","Intercept.",1:sum(colnames(predDatAll)=="Intercept"))  
+    colnames(predDatAll)[colnames(predDatAll)=="Alc"]<-paste(sep="","Alc.",1:sum(colnames(predDatAll)=="Alc"))
+    colnames(predDatAll)[colnames(predDatAll)=="BMIob"]<-paste(sep="","BMIob.",1:sum(colnames(predDatAll)=="BMIob"))
+    colnames(predDatAll)[colnames(predDatAll)=="BMIov"]<-paste(sep="","BMIov.",1:sum(colnames(predDatAll)=="BMIov"))
+    colnames(predDatAll)[colnames(predDatAll)=="BMIun"]<-paste(sep="","BMIun.",1:sum(colnames(predDatAll)=="BMIun"))
+    colnames(predDatAll)[colnames(predDatAll)=="SexF"]<-paste(sep="","SexF.",1:sum(colnames(predDatAll)=="SexF"))
+    
+    
+    predDatAll<-predDatAll %>%
+      mutate(
+        alcohol=case_when(Alc.1==0~"No alcohol",Alc.1==1~"Alcohol"),
+        BMI=case_when(BMIob.1==1~"Obese",BMIov.1==1~"Overweight",BMIun.1==1~"Underweight",TRUE~"Normal weight"),
+        Sex=case_when(SexF.1==1~"Female",SexF.1==0~"Male")
+      )
+    
+    if(!is.null(saveFile)){
+      save(predDatAll,file=saveFile)
+    }
+  }else{
+    load(loadFile)
+  }
+  
+  predDatAllSum<-predDatAll %>%
+    group_by(thr.1,alcohol,BMI,Sex) %>%
+    summarise(
+      sensMedian=median(sens,na.rm=T),
+      sensLow=quantile(probs=0.25,sens,na.rm=T),
+      sensHigh=quantile(probs=0.75,sens,na.rm=T),
+      specMedian=median(spec,na.rm=T),
+      specLow=quantile(probs=0.25,spec,na.rm=T),
+      specHigh=quantile(probs=0.75,spec,na.rm=T),
+      .groups="drop"
+    )
+  colnames(predDatAllSum)[colnames(predDatAllSum)=="thr.1"]<-"thr"
+  
+  if(is.null(xlims)){
+    xlims<-range(parVect)
+  }
+  
+  g<-predDatAllSum %>%
+    ggplot() +
+    geom_line(col="orange",mapping=aes(x=thr,y=sensMedian)) +
+    geom_ribbon(fill="orange",alpha=0.2,mapping=aes(x=thr,ymin=sensLow,ymax=sensHigh)) +
+    geom_line(col="steelblue",mapping=aes(x=thr,y=specMedian,ymin=specLow,ymax=specHigh)) +
+    geom_ribbon(fill="steelblue",alpha=0.2,mapping=aes(x=thr,ymin=specLow,ymax=specHigh)) +
+    scale_x_continuous(limits=xlims) +
+    facet_wrap(~alcohol+BMI+Sex,ncol=4) +
+    xlab("APRI threshold") +
+    ylab("Sensitivity (orange) / specificity (blue)") +
+    theme_light()
+    
+  png(outFile,width=12,height=12,units="in",res=450)
+  print(g)
+  dev.off()
+  
+  return(predDatAll)
+}
+```
+
+## Pre-defined thresholds for APRI and GPR
+
+As noted earlier in this document, there exist recommended thresholds for APRI (>2.0 for F4 and >1.5 for F2) and GPR (>0.56 for F4 and >0.32 for F2). Together with the 2 thresholds for the reference standard for F4 (te>12.2 and te>9.5) and 1 threshold for F2 (te>7.9), this gives 6 models for pre-defined models. The overall sensitivities and specificities for these models ar reported in Tables \@ref(tab:fixedThrSumApri2) and \@ref(tab:fixedThrSumGpr) below. Model-specific tables giving ORs for the different co-variates are given in the appendix.
+
+```{r loadFixed}
+if(!doFixed){
+  load(paste(sep="","output/",dateToLoad,"/fixedThresholdModelsResultsList_",dateToLoad,".RData"))
+}else{
+  fixedThrMods<-list()
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_apri20_te122, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrApri20Te122){
+  fixedThrMods[["apri20_te122_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_122==1,1,2),y=datS$apri_20)
+  fixedThrMods[["apri20_te122_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_122==1,1,2),y=datL$apri_20)
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_apri20_te95, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrApri20Te95){
+  fixedThrMods[["apri20_te95_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_95==1,1,2),y=datS$apri_20)
+  fixedThrMods[["apri20_te95_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_95==1,1,2),y=datL$apri_20)
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_apri15_te79, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrApri15Te79){
+  fixedThrMods[["apri15_te79_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_79==1,1,2),y=datS$apri_15)
+  fixedThrMods[["apri15_te79_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_79==1,1,2),y=datL$apri_15)
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_gpr56_te122, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrGpr56Te122){
+  fixedThrMods[["gpr56_te122_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_122==1,1,2),y=datS$gpr_56,nAdapt=5000) # adaptation takes longer here as hazardous alcohol drinking coefficient difficult to estimate
+  fixedThrMods[["gpr56_te122_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_122==1,1,2),y=datL$gpr_56)
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_gpr56_te95, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrGpr56Te95){
+  fixedThrMods[["gpr56_te95_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_95==1,1,2),y=datS$gpr_56)
+  fixedThrMods[["gpr56_te95_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_95==1,1,2),y=datL$gpr_56)
+}
+```
+
+```{r model4NoBetweenStudyEffectsSimple_gpr32_te79, warning=FALSE, message=FALSE, error=FALSE, results='hide'}
+if(doFixedThrGpr32Te79){
+  fixedThrMods[["gpr32_te79_S"]]<-fitModel(dat=datS,state=ifelse(datS$te_79==1,1,2),y=datS$gpr_32)
+  fixedThrMods[["gpr32_te79_L"]]<-fitModel(dat=datL,state=ifelse(datL$te_79==1,1,2),y=datL$gpr_32)
+}
+```
+
+```{r saveFixedThrMods}
+if(doFixed){
+  save(fixedThrMods,file=paste(sep="",outDir,"/fixedThresholdModelsResultsList_",dateStr,".RData"))
+}
+```
+
+```{r fixedThrSumApri, echo=FALSE, warning=FALSE, error=FALSE, results='hide'}
+fixedThrMods[["apri20_te122_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri20_te122_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["apri20_te122_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri20_te122_S"]]$parsModel4))
+mod_te122_apri20_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["apri20_te122_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri20_te122_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["apri20_te122_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri20_te122_L"]]$parsModel4))
+mod_te122_apri20_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["apri20_te95_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri20_te95_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["apri20_te95_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri20_te95_S"]]$parsModel4))
+mod_te95_apri20_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["apri20_te95_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri20_te95_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["apri20_te95_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri20_te95_L"]]$parsModel4))
+mod_te95_apri20_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["apri15_te79_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri15_te79_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["apri15_te79_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri15_te79_S"]]$parsModel4))
+mod_te79_apri15_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["apri15_te79_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["apri15_te79_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["apri15_te79_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["apri15_te79_L"]]$parsModel4))
+mod_te79_apri15_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr56_te122_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr56_te122_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["gpr56_te122_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr56_te122_S"]]$parsModel4))
+mod_te122_gpr56_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr56_te122_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr56_te122_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["gpr56_te122_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr56_te122_L"]]$parsModel4))
+mod_te122_gpr56_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr56_te95_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr56_te95_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["gpr56_te95_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr56_te95_S"]]$parsModel4))
+mod_te95_gpr56_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr56_te95_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr56_te95_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["gpr56_te95_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr56_te95_L"]]$parsModel4))
+mod_te95_gpr56_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr32_te79_S"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr32_te79_S"]]$parsModel4,dat = datS)
+tmp<-try(summary(fixedThrMods[["gpr32_te79_S"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr32_te79_S"]]$parsModel4))
+mod_te79_gpr32_S<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+fixedThrMods[["gpr32_te79_L"]]$parsModel4<-addPVstoMCMC(fixedThrMods[["gpr32_te79_L"]]$parsModel4,dat = datL)
+tmp<-try(summary(fixedThrMods[["gpr32_te79_L"]]$parsModel4)$statistics,silent=TRUE)
+tmpCI<-t(hdi(fixedThrMods[["gpr32_te79_L"]]$parsModel4))
+mod_te79_gpr32_L<-cbind(tmp,tmpCI)
+rm(tmp,tmpCI)
+
+sumFunTmp<-function(modSumTab){
+  sens<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["sensAvg","Mean"])),"%")
+  sensCIlow<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["sensAvg","lower"])),"%")
+  sensCIupp<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["sensAvg","upper"])),"%")
+  sensCI<-paste(sep="","(",sensCIlow,",",sensCIupp,")")
+  
+  spec<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["specAvg","Mean"])),"%")
+  specCIlow<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["specAvg","lower"])),"%")
+  specCIupp<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["specAvg","upper"])),"%")
+  specCI<-paste(sep="","(",specCIlow,",",specCIupp,")")
+
+  ppv<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["ppvAvg","Mean"])),"%")
+  ppvCIlow<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["ppvAvg","lower"])),"%")
+  ppvCIupp<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["ppvAvg","upper"])),"%")
+  ppvCI<-paste(sep="","(",ppvCIlow,",",ppvCIupp,")")
+  
+  npv<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["npvAvg","Mean"])),"%")
+  npvCIlow<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["npvAvg","lower"])),"%")
+  npvCIupp<-paste(sep="",format(nsmall=2,round(digits=2,100*modSumTab["npvAvg","upper"])),"%")
+  npvCI<-paste(sep="","(",npvCIlow,",",npvCIupp,")")
+  
+  return(c(sens,sensCI,spec,specCI,ppv,ppvCI,npv,npvCI))
+}
+
+fixedThrSumTabApri_S<-data.frame(
+  apri20_te122=sumFunTmp(mod_te122_apri20_S),
+  apri20_te95=sumFunTmp(mod_te95_apri20_S),
+  apri15_te79=sumFunTmp(mod_te79_apri15_S)
+)
+
+fixedThrSumTabApri_L<-data.frame(
+  apri20_te122=sumFunTmp(mod_te122_apri20_L),
+  apri20_te95=sumFunTmp(mod_te95_apri20_L),
+  apri15_te79=sumFunTmp(mod_te79_apri15_L)
+)
+
+fixedThrSumTabApri<-rbind(fixedThrSumTabApri_S,fixedThrSumTabApri_L)
+```
+
+```{r fixedThrSumApri2}
+fixedThrSumTabApri %>%
+  knitr::kable(caption = "Summaries of the sensitivites and specificities for the 3 models for pre-defined thresholds on APRI.", col.names=c("te>12.2","te>9.5","te>7.9"),row.names = FALSE,align = "c") %>%
+  add_header_above(c("APRI>=2.0"=1,"APRI>=2.0"=1,"APRI>=1.5"=1)) %>%
+  pack_rows(group_label="Community, routine and unspecified screening.",1,8) %>%
+  pack_rows(group_label="Suspected liver disease screening.",8,16) %>%
+  pack_rows(group_label="sensitivity\n(95% CI)",1,2) %>%
+  pack_rows(group_label="specificity\n(95% CI)",3,4) %>%
+  pack_rows(group_label="PPV\n(95% CI)",5,6) %>%
+  pack_rows(group_label="NPV\n(95% CI)",7,8) %>%
+  pack_rows(group_label="sensitivity\n(95% CI)",9,10) %>%
+  pack_rows(group_label="specificity\n(95% CI)",11,12) %>%
+  pack_rows(group_label="PPV\n(95% CI)",13,14) %>%
+  pack_rows(group_label="NPV\n(95% CI)",15,16) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r fixedThrSumGpr, echo=FALSE}
+fixedThrSumTabGpr_S<-data.frame(
+  gpr56_te122=sumFunTmp(mod_te122_gpr56_S),
+  gpr56_te95=sumFunTmp(mod_te95_gpr56_S),
+  gpr32_te79=sumFunTmp(mod_te79_gpr32_S)
+)
+
+fixedThrSumTabGpr_L<-data.frame(
+  gpr56_te122=sumFunTmp(mod_te122_gpr56_L),
+  gpr56_te95=sumFunTmp(mod_te95_gpr56_L),
+  gpr32_te79=sumFunTmp(mod_te79_gpr32_L)
+)
+
+fixedThrSumTabGpr<-rbind(fixedThrSumTabGpr_S,fixedThrSumTabGpr_L)
+
+fixedThrSumTabGpr %>%
+  knitr::kable(caption = "Summaries of the sensitivites and specificities for the 3 models for pre-defined thresholds on GPR.", col.names=c("te>12.2","te>9.5","te>7.9"),row.names = FALSE,align = "c") %>%
+  add_header_above(c("GPR>=0.56"=1,"GPR>=0.56"=1,"GPR>=0.32"=1)) %>%
+  pack_rows(group_label="Community, routine and unspecified screening.",1,8) %>%
+  pack_rows(group_label="Suspected liver disease screening.",8,16) %>%
+  pack_rows(group_label="sensitivity\n(95% CI)",1,2) %>%
+  pack_rows(group_label="specificity\n(95% CI)",3,4) %>%
+  pack_rows(group_label="PPV\n(95% CI)",5,6) %>%
+  pack_rows(group_label="NPV\n(95% CI)",7,8) %>%
+  pack_rows(group_label="sensitivity\n(95% CI)",9,10) %>%
+  pack_rows(group_label="specificity\n(95% CI)",11,12) %>%
+  pack_rows(group_label="PPV\n(95% CI)",13,14) %>%
+  pack_rows(group_label="NPV\n(95% CI)",15,16) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+## Optimum threshold for APRI with fixed ULN (40)
+
+```{r setupLists}
+modList<-list()
+resultList<-list()
+tablePVsSensSpec<-list()
+
+bestModels<-list()
+bestThrs<-list()
+
+aucs<-list()
+
+apriFixedUlnVect<-unique(c(0,1.5,2,round(digits=2,quantile(dat$apriFixedUln,probs=seq(0,1,length=40),na.rm=T))))
+apriFixedUlnVect<-sort(apriFixedUlnVect) # length 42
+
+gprFixedUlnVect<-unique(c(0,1,2,round(digits=2,quantile(dat$gprFixedUln,probs=seq(0,1,length=54),na.rm=T))))
+gprFixedUlnVect<-sort(gprFixedUlnVect) # length 43
+
+altVect<-unique(c(5,8,round(digits=0,quantile(dat$alt,probs=seq(0,1,length=52),na.rm=T))))
+altVect<-c(0,altVect) # length 42
+
+fib4Vect<-unique(c(0,6,10,round(digits=2,quantile(dat$fib4,probs=seq(0,1,length=40),na.rm=T))))
+fib4Vect<-sort(fib4Vect) # length 43
+```
+
+### F4 - te > 12.2kPa
+
+#### No suspected liver disease
+
+```{r apriFixedUln122Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_S"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-apriFixedUlnVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datS)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln122VectSummary_S, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln122SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln122ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln122Forest_S, warning=FALSE, fig.cap="Forest plots for APRI (fixed ULN) with te >= 12.2kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Sensitivities and specificities within subgroups
+
+```{r apriFixedUln122SubgroupsFacet_S, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="apriFixedUln_S_samples_",replacement="",grep(value=T,pattern="samples",names(modList$apriFixedUln_S$te122))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$apriFixedUln_S$te122,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"),prefix="apriFixedUln_S_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Aprifixeduln_s_Te122_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r apriFixedUln122Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_L"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-apriFixedUlnVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datL)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln122VectSummary_L, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln122SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln122ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln122Forest_L, warning=FALSE, fig.cap="Forest plots for APRI (fixed ULN) with te >= 12.2kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Sensitivities and specificities within subgroups
+
+```{r apriFixedUln122SubgroupsFacet_L, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="apriFixedUln_L_samples_",replacement="",grep(value=T,pattern="samples",names(modList$apriFixedUln_L$te122))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$apriFixedUln_L$te122,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"),prefix="apriFixedUln_L_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Aprifixeduln_l_Te122_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+
+### F4 - te > 9.5kPa
+
+#### No suspected liver disease
+
+```{r apriFixedUln95Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_S"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-apriFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln95VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln95SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln95ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln95Forest_S, warning=FALSE, fig.cap="Forest plots for APRI (fixed ULN) with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r apriFixedUln95Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_L"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-apriFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln95VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln95SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln95ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln95Forest_L, warning=FALSE, fig.cap="Forest plots for APRI (fixed ULN) with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+
+### F2 - te > 7.9kPa
+
+#### No suspected liver disease
+
+```{r apriFixedUln79Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_S"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-apriFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datS)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln79VectSummary_S, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln79SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln79ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln79Forest_S, warning=FALSE, fig.cap="Forest plots for APRI with te >= 7.9kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+#### Sensitivities and specificities within subgroups
+
+```{r apriFixedUln79SubgroupsFacet_S, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 7.9 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="apriFixedUln_S_samples_",replacement="",grep(value=T,pattern="samples",names(modList$apriFixedUln_S$te79))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$apriFixedUln_S$te79,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"),prefix="apriFixedUln_S_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Aprifixeduln_s_Te79_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r apriFixedUln79Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"apriFixedUln_L"
+yVarAnnot<-"APRI (fixed ULN)"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-apriFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptApriFixedUlnTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datL)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r apriFixedUln79VectSummary_L, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r apriFixedUln79SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r apriFixedUln79ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r apriFixedUln79Forest_L, warning=FALSE, fig.cap="Forest plots for APRI with te >= 7.9kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+```{r apriFixedUln79SubgroupsFacet_L, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 7.9 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="apriFixedUln_L_samples_",replacement="",grep(value=T,pattern="samples",names(modList$apriFixedUln_L$te79))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$apriFixedUln_L$te79,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"),prefix="apriFixedUln_L_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Aprifixeduln_l_Te79_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+## Optimum threshold for GPR with fixed ULN (61)
+
+### F4 - te > 12.2kPa
+
+#### No suspected liver disease
+
+```{r gprFixedUln122Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_S"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-gprFixedUlnVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datS)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln122VectSummary_S, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln122SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln122ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln122Forest_S, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 12.2kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Sensitivities and specificities within subgroups
+
+```{r gprFixedUln122SubgroupsFacet_S, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="gprFixedUln_S_samples_",replacement="",grep(value=T,pattern="samples",names(modList$gprFixedUln_S$te122))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$gprFixedUln_S$te122,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"),prefix="gprFixedUln_S_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Gprifixeduln_s_Te122_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r gprFixedUln122Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_L"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-gprFixedUlnVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datL)
+
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln122VectSummary_L, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln122SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln122ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln122Forest_L, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 12.2kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Sensitivities and specificities within subgroups
+
+```{r gprFixedUln122SubgroupsFacet_L, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="gprFixedUln_L_samples_",replacement="",grep(value=T,pattern="samples",names(modList$gprFixedUln_L$te122))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$gprFixedUln_L$te122,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"),prefix="gprFixedUln_L_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Gprifixeduln_l_Te122_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+
+### F4 - te > 9.5kPa
+
+#### No suspected liver disease
+
+```{r gprFixedUln95Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_S"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-gprFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln95VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln95SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln95ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln95Forest_S, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r gprFixedUln95Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_L"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-gprFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln95VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln95SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln95ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln95Forest_L, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+
+### F2 - te > 7.9kPa
+
+#### No suspected liver disease
+
+```{r gprFixedUln79Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_S"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-gprFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datS)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln79VectSummary_S, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln79SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln79ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln79Forest_S, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 7.9kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+##### Sensitivities and specificities within subgroups
+
+```{r gprFixedUln79SubgroupsFacet_S, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="gprFixedUln_S_samples_",replacement="",grep(value=T,pattern="samples",names(modList$gprFixedUln_S$te79))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$gprFixedUln_S$te79,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"),prefix="gprFixedUln_S_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Gprifixeduln_s_Te79_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r gprFixedUln79Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"gprFixedUln_L"
+yVarAnnot<-"GPR (fixed ULN)"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-gprFixedUlnVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptGprFixedUlnTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  parVectTmp<-sort(as.numeric(unique(gsub(pattern="[a-zA-Z\\_]*",replacement="",names(mod)))))
+  result<-redoMcmcSummary(modObj=mod,resObj=result,yVar=yVar,teThr=teThr,parVect=parVectTmp,dat=datL)
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r gprFixedUln79VectSummary_L, warning=F, message=F, error=FALSE}
+parVectTmp<-sort(as.numeric(gsub(names(resultList[[yVar]][[teThr]]),pattern=yVar,replacement="")))
+
+sumMods<-sumPlotFun(parVect=parVectTmp,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr)
+
+tablePVsSensSpec[[yVar]][[teThr]]<-data.frame(thr=parVectTmp,PPV=NA,NPV=NA,Sens=NA,Spec=NA)
+for(i in 1:length(parVectTmp)){
+  pars<-parVectTmp[i]
+  tablePVsSensSpec[[yVar]][[teThr]]$PPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["PPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$NPV[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["NPV (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Sens[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["sensitivity (pop. average)","CrI"])
+  tablePVsSensSpec[[yVar]][[teThr]]$Spec[i]<-paste(sep=" ",format(nsmall=4,round(digits=4,resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","Mean"])),resultList[[yVar]][[teThr]][[paste(sep="",yVar,pars)]]["specificity (pop. average)","CrI"])
+}
+
+tablePVsSensSpec[[yVar]][[teThr]] %>%
+  kable(caption=paste(sep="","PPV, NPV, sensitivity and specificity for ",yVarAnnot,"(te > ",teThrAnnot,") at different tresholds."),col.names=c("Threshold","PPV (95% CrI)","NPV (95% CrI)","Sensitivity (95% CrI)","Specificity (95% CrI)")) %>%
+  kable_styling(full_width = FALSE)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r gprFixedUln79SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r gprFixedUln79ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r gprFixedUln79Forest_L, warning=FALSE, fig.cap="Forest plots for GPR (fixed ULN) with te >= 7.9kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+##### Sensitivities and specificities within subgroups
+
+```{r gprFixedUln79SubgroupsFacet_L, warning=FALSE, fig.cap="Sensitivities and specifities at different thresholds for subgroups defined by hazardous alcohol usage (yes, no), BMI category (underweight, normal weight, overweight, obese), screening reason (suspected liver disease or routine / community screening) and sex (male, female). Some of these groups have very few positive cases (according to te > 12.2 kPa) hence the coefficient estimates for those parameter combinations are characterised by greater uncertainty and hence resulting in sensitivity curves for some subgroups that are jagged and non-monotonic. The confidence bands are interquartile ranges of the values from the MCMC runs, solid lines are medians computed over the MCMC runs."}
+parVectPlot<-sort(unique(as.numeric(gsub(pattern="gprFixedUln_L_samples_",replacement="",grep(value=T,pattern="samples",names(modList$gprFixedUln_L$te79))))))
+
+g<-predictSensSpecFromModel(parVect=parVectPlot,mcmcSamples=modList$gprFixedUln_L$te79,outFile=paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"),prefix="gprFixedUln_L_samples",loadFile="output/20220301/sensSpecBySubgroupsFacetPlot_Gprifixeduln_l_Te79_20220301.RData",saveFile=NULL,xlims=c(0,2))
+
+include_graphics(paste(sep="",outDir,"/sensSpecBySubgroupsFacetPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+
+## Optimum thresholds for ALT
+
+### F4 - te > 12.2kPa
+
+#### No suspected liver disease
+
+```{r alt122Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_S"
+yVarAnnot<-"ALT"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-altVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt122VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt122SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt122ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt122Forest_S, warning=FALSE, fig.cap="Forest plots for ALT with te >= 12.2kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r alt122Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_L"
+yVarAnnot<-"ALT"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-altVect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt122VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt122SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt122ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt122Forest_L, warning=FALSE, fig.cap="Forest plots for ALT with te >= 12.2kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+
+### F4 - te > 9.5kPa
+
+#### No suspected liver disease
+
+```{r alt95Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_S"
+yVarAnnot<-"ALT"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-altVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt95VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt95SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt95ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt95Forest_S, warning=FALSE, fig.cap="Forest plots for ALT with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r alt95Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_L"
+yVarAnnot<-"ALT"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-altVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt95VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt95SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt95ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt95Forest_L, warning=FALSE, fig.cap="Forest plots for ALT with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+
+### F2 - te > 7.9kPa
+
+#### No suspected liver disease
+
+```{r alt79Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_S"
+yVarAnnot<-"ALT"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-altVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt79VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt79SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt79ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt79Forest_S, warning=FALSE, fig.cap="Forest plots for ALT with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r alt79Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"alt_L"
+yVarAnnot<-"ALT"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-altVect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptAltTe79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r alt79VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=102)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r alt79SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r alt79ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r alt79Forest_L, warning=FALSE, fig.cap="Forest plots for ALT with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+
+## Optimum thresholds for FIB4
+
+### F4 - te > 12.2kPa
+
+#### No suspected liver disease
+
+```{r fib4122Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_S"
+yVarAnnot<-"FIB4"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-fib4Vect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib4122VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib4122SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib4122ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib4122Forest_S, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 12.2kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+#### No suspected liver disease
+
+```{r fib4122Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_L"
+yVarAnnot<-"FIB4"
+teThr<-"te122"
+teThrAnnot<-"12.2kPa"
+parVect<-fib4Vect
+
+bestModels[[yVar]]<-list()
+bestThrs[[yVar]]<-list()
+aucs[[yVar]]<-list()
+modList[[yVar]]<-list()
+resultList[[yVar]]<-list()
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te122){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_122==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib4122VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib4122SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib4122ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib4122sForest_L, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 12.2kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=12.2,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te122_",dateStr,".png"))
+```
+
+### F4 - te > 9.5kPa
+
+#### No suspected liver disease
+
+```{r fib495Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_S"
+yVarAnnot<-"FIB4"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-fib4Vect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib495VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib495SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib495ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib495Forest_S, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r fib495Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_L"
+yVarAnnot<-"FIB4"
+teThr<-"te95"
+teThrAnnot<-"9.5kPa"
+parVect<-fib4Vect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te95){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_95==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib495VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib495SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib495ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib495Forest_L, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=9.5,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te95_",dateStr,".png"))
+```
+
+
+### F2 - te > 7.9kPa
+
+#### No suspected liver disease
+
+```{r fib479Vect_S, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_S"
+yVarAnnot<-"FIB4"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-fib4Vect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datS,state=ifelse(datS$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib479VectSummary_S, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","No suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib479SensSpecMarker_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib479ROC_S}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib479Forest_S, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 9.5kPa."}
+doForest(dat=datS,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+#### Suspected liver disease
+
+```{r fib479Vect_L, warning=F, message=F, error=FALSE, results='hide'}
+yVar<-"fib4_L"
+yVarAnnot<-"FIB4"
+teThr<-"te79"
+teThrAnnot<-"7.9kPa"
+parVect<-fib4Vect
+
+modList[[yVar]][[teThr]]<-list()
+resultList[[yVar]][[teThr]]<-list()
+
+if(doOptFib4Te79){
+  parList<-fitModelsPar(nThread=nThread,parVect=parVect,yVar=gsub(yVar,pattern="_[LS]$",replacement=""),dat=datL,state=ifelse(datL$te_79==1,1,2),randSeed=20210615,nAdapt=2500,nIter=6000,nChains=4)
+  
+  for(i in 1:length(parVect)){
+    thr<-parVect[i]
+    
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_mod_",thr)]]<-parList[[i]]$model
+    modList[[yVar]][[teThr]][[paste(sep="",yVar,"_samples_",thr)]]<-parList[[i]]$pars
+    resultList[[yVar]][[teThr]][[paste(sep="",yVar,thr)]]<-parList[[i]]$results
+  }
+  
+  rm(parList)
+  mod<-modList[[yVar]][[teThr]]
+  result<-resultList[[yVar]][[teThr]]
+  save(mod,result,file=paste(sep="",outDir,"/",yVar,"_ResultsList_",teThr,"_",dateStr,".RData"))
+}else{
+  load(paste(sep="","output/",dateToLoad,"/",yVar,"_ResultsList_",teThr,"_",dateToLoad,".RData"))
+  
+  modList[[yVar]][[teThr]]<-mod
+  resultList[[yVar]][[teThr]]<-result
+}
+```
+
+```{r fib479VectSummary_L, warning=F, message=F, error=FALSE}
+sumMods<-sumPlotFun(parVect=parVect,yVar=yVar,yVarAnnot=yVarAnnot,teThr=teThr,teThrAnnot=teThrAnnot,outDir=outDir,dateStr=dateStr,xlim=10)
+
+resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]] %>%
+  kable(caption=paste(sep="","Suspected liver disease model. Best (according to Youden's J) ",yVarAnnot," model for te > ",teThrAnnot," with site/study specific sensitivities and specificities (random effects). Best ",yVar," threshold = ",sumMods$bestThr,"."),digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+bestModels[[yVar]][[teThr]]<-resultList[[yVar]][[teThr]][[paste(sep="",yVar,sumMods$bestThr)]]
+bestThrs[[yVar]][[teThr]]<-sumMods$bestThr
+aucs[[yVar]][[teThr]]<-sumMods$auc
+```
+
+```{r fib479SensSpecMarker_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_SensSpec_vs_",yVar,"_",dateStr,".png"))
+```
+
+```{r fib479ROC_L}
+include_graphics(paste(sep="",outDir,"/",yVar,"_",teThr,"_ROC_",dateStr,".png"))
+```
+
+```{r fib479Forest_L, warning=FALSE, fig.cap="Forest plots for FIB4 with te >= 9.5kPa."}
+doForest(dat=datL,bestThr=sumMods$bestThr,marker=yVar,teThr=7.9,outDir=outDir,dateStr=dateStr)
+include_graphics(paste(sep="",outDir,"/forestPlot_",str_to_title(yVar),"_Te79_",dateStr,".png"))
+```
+
+
+## Appendix - models for fixed thresholds on APRI and GPR
+
+```{r model4Apri20Te122Summary}
+tmp<-mod_te122_apri20_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq2.0$ and te>12.2 (F4) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te122_apri20_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq2.0$ and te>12.2 (F4) for suspected liver disease patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model4Apri20Te95Summary}
+tmp<-mod_te95_apri20_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq2.0$ and te>9.5 (F4) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te95_apri20_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq2.0$ and te>9.5 (F4) for suspected liver disase patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model4Apri15Te79Summary}
+tmp<-mod_te79_apri15_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq1.5$ and te>7.9 (F2) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te79_apri15_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for APRI$\\geq1.5$ and te>7.9 (F2) for suspected liver disease patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model4Gpr56Te122Summary}
+tmp<-mod_te122_gpr56_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.56$ and te>12.2 (F4) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te122_gpr56_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.56$ and te>12.2 (F4) for suspected liver disease patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model4Gpr56Te95Summary}
+tmp<-mod_te95_gpr56_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.56$ and te>9.5 (F4) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te95_gpr56_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.56$ and te>9.5 (F4) for suspected liver disease patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r model4Gpr32Te79Summary}
+tmp<-mod_te79_gpr32_S %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.32$ and te>7.9 (F2) for routinely screened patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+
+tmp<-mod_te79_gpr32_L %>%
+  as.data.frame() %>%
+  mutate(
+    Mean=case_when(Mean>1e100~Inf,TRUE~Mean),
+    upper=case_when(upper>1e100~Inf,TRUE~upper)) %>%
+  mutate(CrI=paste(sep="","(",format(nsmall=4,round(digits=4,lower)),",",format(nsmall=4,round(digits=4,upper)),")")) %>%
+  dplyr::select(c(Mean,CrI))
+rownames(tmp)<-c("hazardous alcohol drinking (OR for sensitivity)","hazardous alcohol drinking (OR for specificity)","BMI: obese (OR for sensitivity)","BMI: obese (OR for specificity)","BMI: overweight (OR for sensitivity)","BMI: overweight (OR for specificity)","BMI: underweight (OR for sensitivity)","BMI: underweight (OR for specificity)","sex female (OR for sensitivity)","sex female (OR for specificity)","random effects variance (logit sensitivity)","random effects variance (logit specificity)","sensitivity (pop. average)","sensitivity (reference)","specificity (pop. average)","specificity (reference)","PPV (pop. average)","NPV (pop. average)")
+
+tmp %>%
+  kable(caption="Bivariate random effects model for GPR$\\geq0.32$ and te>7.9 (F2) for suspected liver disease patients.",digits=4,col.names=c("Posterior mean","95% HDI credible interval"),align=c("r","r")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+
+## Overall summaries
+
+### AUCs
+
+```{r sumAUCs}
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_S","gprFixedUln_S","alt_S","fib4_S")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+aucDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(aucDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp<-aucs[[m]][[te]]
+    if(!is.null(tmp)){aucDf[toupper(m),te]<-tmp}
+  }
+}
+
+rownames(aucDf)<-displayNames
+
+aucDf %>%
+  kable(caption="Estimated AUCs for the different biomarkers and thresholds on transient elastrography - routinely screened patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_L","gprFixedUln_L","alt_L","fib4_L")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+aucDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(aucDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp<-aucs[[m]][[te]]
+    if(!is.null(tmp)){aucDf[toupper(m),te]<-tmp}
+  }
+}
+
+rownames(aucDf)<-displayNames
+
+aucDf %>%
+  kable(caption="Estimated AUCs for the different biomarkers and thresholds on transient elastrography - suspected liver disease patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Optimal thresholds
+
+```{r sumThrs}
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_S","gprFixedUln_S","alt_S","fib4_S")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+thrDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(thrDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp<-bestThrs[[m]][[te]]
+    if(!is.null(tmp)){thrDf[toupper(m),te]<-tmp}
+  }
+}
+
+thrDf["ALT_S",]<-as.character(thrDf["ALT_S",])
+
+rownames(thrDf)<-displayNames
+
+thrDf %>%
+  kable(caption="Estimated optimal thresholds for the different biomarkers and thresholds on transient elastrography - routinely screened patients. Fixed ULN for APRI was 40 and for GPR it was 61.",col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)"),align="c") %>%
+  kable_styling(full_width = FALSE)
+
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_L","gprFixedUln_L","alt_L","fib4_L")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+thrDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(thrDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp<-bestThrs[[m]][[te]]
+    if(!is.null(tmp)){thrDf[toupper(m),te]<-tmp}
+  }
+}
+
+thrDf["ALT_L",]<-as.character(thrDf["ALT_L",])
+
+rownames(thrDf)<-displayNames
+
+thrDf %>%
+  kable(caption="Estimated optimal thresholds for the different biomarkers and thresholds on transient elastrography - suspected liver disease patients. Fixed ULN for APRI was 40 and for GPR it was 61.",col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)"),align="c") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Sensitivities (for the optimal threshold models)
+
+```{r sumBestModelSens}
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_S","gprFixedUln_S","alt_S","fib4_S")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+sensDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(sensDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp1<-bestModels[[m]][[te]]["sensitivity (pop. average)","Mean"]
+    tmp2<-bestModels[[m]][[te]]["sensitivity (pop. average)","CrI"]
+     if(!is.null(tmp1) & !is.null(tmp2)){
+       tmp<-paste(sep=" ",format(nsmall=4,round(digits=4,tmp1)),tmp2)
+       sensDf[toupper(m),te]<-tmp
+     }
+  }
+}
+
+rownames(sensDf)<-displayNames
+
+sensDf %>%
+  kable(caption="Estimated population averaged sensitivities (95% confidence intervals) for the different biomarkers and thresholds on transient elastrography - routinely screened patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_L","gprFixedUln_L","alt_L","fib4_L")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+sensDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(sensDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp1<-bestModels[[m]][[te]]["sensitivity (pop. average)","Mean"]
+    tmp2<-bestModels[[m]][[te]]["sensitivity (pop. average)","CrI"]
+     if(!is.null(tmp1) & !is.null(tmp2)){
+       tmp<-paste(sep=" ",format(nsmall=4,round(digits=4,tmp1)),tmp2)
+       sensDf[toupper(m),te]<-tmp
+     }
+  }
+}
+
+rownames(sensDf)<-displayNames
+
+sensDf %>%
+  kable(caption="Estimated population averaged sensitivities (95% confidence intervals) for the different biomarkers and thresholds on transient elastrography - suspected liver disease patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Specificities (for the optimal threshold models)
+
+```{r sumBestModelSpec}
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_S","gprFixedUln_S","alt_S","fib4_S")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+specDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(specDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp1<-bestModels[[m]][[te]]["specificity (pop. average)","Mean"]
+    tmp2<-bestModels[[m]][[te]]["specificity (pop. average)","CrI"]
+     if(!is.null(tmp1) & !is.null(tmp2)){
+       tmp<-paste(sep=" ",format(nsmall=4,round(digits=4,tmp1)),tmp2)
+       specDf[toupper(m),te]<-tmp
+     }
+  }
+}
+
+rownames(specDf)<-displayNames
+
+specDf %>%
+  kable(caption="Estimated population averaged specificities (95% confidence intervals) for the different biomarkers and thresholds on transient elastrography - routinely screened patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+
+teVect<-c("te122","te95","te79")
+markerVect<-c("apriFixedUln_L","gprFixedUln_L","alt_L","fib4_L")
+displayNames<-c("APRI - FIXED ULN","GPR - FIXED ULN","ALT","FIB4")
+
+specDf<-data.frame(te122=rep(NA,length(markerVect)),te95=NA,te79=NA)
+rownames(specDf)<-toupper(markerVect)
+
+for(te in teVect){
+  for(m in markerVect){
+    tmp1<-bestModels[[m]][[te]]["specificity (pop. average)","Mean"]
+    tmp2<-bestModels[[m]][[te]]["specificity (pop. average)","CrI"]
+     if(!is.null(tmp1) & !is.null(tmp2)){
+       tmp<-paste(sep=" ",format(nsmall=4,round(digits=4,tmp1)),tmp2)
+       specDf[toupper(m),te]<-tmp
+     }
+  }
+}
+
+rownames(specDf)<-displayNames
+
+specDf %>%
+  kable(caption="Estimated population averaged specificities (95% confidence intervals) for the different biomarkers and thresholds on transient elastrography - suspected liver disease patients. Fixed ULN for APRI was 40 and for GPR it was 61.",digits = 2,col.names=c("te>12.2 (F4)","te>9.5 (F4)","te>7.9 (F2)")) %>%
+  kable_styling(full_width = FALSE)
+```
