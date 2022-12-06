@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/374695584.svg)](https://zenodo.org/badge/latestdoi/374695584)[![DOI](https://zenodo.org/badge/374695584.svg)](https://zenodo.org/badge/latestdoi/374695584)
+
 ## Purpose of this analysis
 
 This repository contains code for Bayesian bivariate random-effects models for the HEPSANET systematic review [PROSPERO registration CRD42020218043](https://www.crd.york.ac.uk/prospero/display_record.php?ID=CRD42020218043).
